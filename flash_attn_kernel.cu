@@ -7,6 +7,9 @@
 #include <cmath>
 #include <cfloat>
 #include <cuda_fp16.h>
+#include <mma.h>
+
+using namespace nvcuda;
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be a contiguous tensor")
@@ -206,6 +209,69 @@ __device__ inline float warp_reduce_max(float val) {
         val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     }
     return val;
+}
+
+// WMMA QK^T 计算：一个 warp 处理 16x16 score tile
+// 计算 Q[16,D] @ K[16,D]^T = scores[16,16]
+__device__ void wmma_compute_qk(
+    const half* Q_16xD,      // Q 的 16xD 块 (row-major)
+    const half* K_16xD,      // K 的 16xD 块 (row-major)
+    float scores[16][16],    // 输出 scores
+    int D,
+    float scale,
+    int q_global_row,        // Q 的起始全局行号
+    int k_global_row,        // K 的起始全局行号
+    bool causal
+) {
+    // WMMA fragments
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    
+    // 初始化累加器为 0
+    wmma::fill_fragment(c_frag, 0.0f);
+    
+    // 沿着 D 维度迭代 (D 必须是 16 的倍数)
+    for (int d = 0; d < D; d += 16) {
+        // 加载 Q[16, 16] (row-major)
+        wmma::load_matrix_sync(a_frag, Q_16xD + d, D);
+        
+        // 加载 K[16, 16] (col_major)
+        // col_major 会将 K[16,16] 视为 K^T[16,16]
+        // 因此 WMMA 计算的是 Q @ K^T ✓
+        wmma::load_matrix_sync(b_frag, K_16xD + d, D);
+        
+        // 执行矩阵乘法: C = A * B + C
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    
+    // 存储到 shared memory (每个 warp 使用不同的 offset)
+    __shared__ float temp_buffers[4][256];  // 4 warps
+    int warp_id = threadIdx.x / 32;
+    float* temp_buffer = temp_buffers[warp_id];
+    
+    wmma::store_matrix_sync(temp_buffer, c_frag, 16, wmma::mem_row_major);
+    
+    // 应用 scale 和 causal mask
+    // 每个 thread 处理部分元素
+    int tid_in_warp = threadIdx.x % 32;
+    for (int idx = tid_in_warp; idx < 256; idx += 32) {
+        int i = idx / 16;
+        int j = idx % 16;
+        int qi = q_global_row + i;
+        int kj = k_global_row + j;
+        float val = temp_buffer[idx] * scale;
+        
+        // 应用 causal mask
+        if (causal && kj > qi) {
+            scores[i][j] = -FLT_MAX;
+        } else {
+            scores[i][j] = val;
+        }
+    }
+    
+    // 等待所有 thread 完成写入 scores
+    __syncwarp();
 }
 
 // 原始 FP16 内核（half2 向量化版本）
@@ -1066,6 +1132,217 @@ torch::Tensor flash_attn_forward_fp16(
     float scale = 1.0f / std::sqrt((float)D);
 
     flash_attn_kernel_fp16<<<qrid, block>>>(
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        B,
+        H,
+        N,
+        D,
+        causal,
+        scale
+    );
+    
+    return out;
+}
+
+// WMMA 优化版本：使用 Tensor Core 加速 QK^T 计算
+__global__ void flash_attn_kernel_fp16_wmma(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H,
+    int N,
+    int D,
+    bool causal,
+    float scale
+) {
+    int q_tile_idx = blockIdx.x;
+    int bh = blockIdx.y;
+    
+    int b = bh / H;
+    int h = bh % H;
+    
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;  // 0-3 (4 warps)
+    int lane_id = tid % 32;
+    
+    int q_start = q_tile_idx * 32;  // TILE_Q = 32
+    if (q_start >= N) return;
+    
+    // Base pointers
+    const half* Q_ptr = Q + ((b * H + h) * N * D);
+    const half* K_ptr = K + ((b * H + h) * N * D);
+    const half* V_ptr = V + ((b * H + h) * N * D);
+    half* O_ptr = O + ((b * H + h) * N * D);
+    
+    // Shared memory
+    __shared__ half sQ[32][MAX_D];
+    __shared__ half sK[32][MAX_D];
+    __shared__ half sV[32][MAX_D];
+    
+    // 每个 warp 处理 16 个 queries
+    if (warp_id >= 2) return;  // 只使用前 2 个 warps (处理 32 queries)
+    
+    int warp_q_start = warp_id * 16;
+    
+    // 加载 Q (协作加载)
+    for (int q_local = warp_q_start; q_local < warp_q_start + 16; ++q_local) {
+        int q_global = q_start + q_local;
+        if (q_global < N) {
+            const half* q_row = Q_ptr + q_global * D;
+            for (int d = lane_id; d < D; d += 32) {
+                sQ[q_local][d] = q_row[d];
+            }
+        }
+    }
+    __syncthreads();
+    
+    // Online softmax 状态 (per query) - 使用更小的寄存器占用
+    // 只存储当前 block 的临时数据，累加器使用 shared memory
+    __shared__ float sAcc[32][MAX_D];  // 共享内存存储累加器
+    __shared__ float sM[32];
+    __shared__ float sL[32];
+    
+    // 初始化
+    for (int i = 0; i < 16; ++i) {
+        sM[warp_q_start + i] = -FLT_MAX;
+        sL[warp_q_start + i] = 0.f;
+        for (int d = 0; d < D; ++d) {
+            sAcc[warp_q_start + i][d] = 0.f;
+        }
+    }
+    __syncthreads();
+    
+    // 迭代 K/V blocks
+    for (int k_start = 0; k_start < N; k_start += 32) {  // TILE_K = 32
+        int k_len = min(32, N - k_start);
+        
+        // 协作加载 K/V
+        for (int idx = tid; idx < k_len * D; idx += blockDim.x) {
+            int row = idx / D;
+            int col = idx % D;
+            sK[row][col] = K_ptr[(k_start + row) * D + col];
+            sV[row][col] = V_ptr[(k_start + row) * D + col];
+        }
+        __syncthreads();
+        
+        // WMMA 计算 QK^T (每个 warp 处理 16x16 score tile)
+        // 沿着 K 的 32 行，每次处理 16 行
+        for (int k_block = 0; k_block < 2; ++k_block) {
+            int k_block_start = k_block * 16;
+            int k_block_len = min(16, k_len - k_block_start);
+            if (k_block_len <= 0) continue;
+            
+            // 使用 WMMA 计算 16x16 scores
+            float scores[16][16];
+            
+            wmma_compute_qk(
+                &sQ[warp_q_start][0],           // Q[16, D]
+                &sK[k_block_start][0],          // K[16, D]
+                scores,                          // 输出 [16, 16]
+                D, scale,
+                q_start + warp_q_start,         // Q 全局起始
+                k_start + k_block_start,        // K 全局起始
+                causal
+            );
+            
+            // Online softmax (per query)
+            for (int qi = 0; qi < 16; ++qi) {
+                int q_global = q_start + warp_q_start + qi;
+                if (q_global >= N) continue;
+                
+                // 计算 block max
+                float m_block = -FLT_MAX;
+                for (int j = 0; j < k_block_len; ++j) {
+                    m_block = fmaxf(m_block, scores[qi][j]);
+                }
+                
+                // Warp-level max reduction
+                m_block = warp_reduce_max(m_block);
+                m_block = __shfl_sync(0xffffffff, m_block, 0);
+                
+                if (m_block == -FLT_MAX) continue;
+                
+                float m_old = sM[warp_q_start + qi];
+                float m_new = fmaxf(m_old, m_block);
+                float alpha = (m_old == -FLT_MAX) ? 0.f : expf(m_old - m_new);
+                
+                float beta_sum = 0.f;
+                
+                // 计算加权和 (直接使用寄存器，但不存储整个数组)
+                for (int j = 0; j < k_block_len; ++j) {
+                    if (scores[qi][j] == -FLT_MAX) continue;
+                    
+                    float p = expf(scores[qi][j] - m_new);
+                    beta_sum += p;
+                    
+                    // 直接更新 shared memory 中的累加器
+                    for (int d = lane_id; d < D; d += 32) {
+                        sAcc[warp_q_start + qi][d] = alpha * sAcc[warp_q_start + qi][d] + 
+                                                     __half2float(sV[k_block_start + j][d]) * p;
+                    }
+                }
+                
+                // Warp-level reduction for beta_sum
+                beta_sum = warp_reduce_sum(beta_sum);
+                beta_sum = __shfl_sync(0xffffffff, beta_sum, 0);
+                
+                // 更新状态
+                sL[warp_q_start + qi] = alpha * sL[warp_q_start + qi] + beta_sum;
+                sM[warp_q_start + qi] = m_new;
+            }
+        }
+        
+        __syncthreads();
+    }
+    
+    // 写回结果
+    for (int qi = 0; qi < 16; ++qi) {
+        int q_global = q_start + warp_q_start + qi;
+        if (q_global >= N) continue;
+        
+        float l_val = sL[warp_q_start + qi];
+        if (l_val > 0.f) {
+            for (int d = lane_id; d < D; d += 32) {
+                O_ptr[q_global * D + d] = __float2half(sAcc[warp_q_start + qi][d] / l_val);
+            }
+        }
+    }
+}
+
+torch::Tensor flash_attn_forward_fp16_wmma(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal
+) {
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    TORCH_CHECK(q.size(3) % 16 == 0, "D must be multiple of 16 for WMMA");
+
+    auto B = q.size(0);
+    auto H = q.size(1);
+    auto N = q.size(2);
+    auto D = q.size(3);
+
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+
+    auto out = torch::zeros_like(q);
+
+    // 每个 block 处理 32 个 queries
+    dim3 qrid((N + 31) / 32, B * H);
+    dim3 block(128);  // 4 warps = 128 threads
+
+    float scale = 1.0f / std::sqrt((float)D);
+
+    flash_attn_kernel_fp16_wmma<<<qrid, block>>>(
         reinterpret_cast<half*>(q.data_ptr<at::Half>()),
         reinterpret_cast<half*>(k.data_ptr<at::Half>()),
         reinterpret_cast<half*>(v.data_ptr<at::Half>()),

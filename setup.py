@@ -12,7 +12,8 @@ setup(
                                 '-O3', 
                                 '--use_fast_math', 
                                 '-lineinfo', 
-                                '-gencode=arch=compute_70,code=sm_70']})
+                                '-gencode=arch=compute_70,code=sm_70',
+                                '-std=c++17']})
     ],
     cmdclass={
         'build_ext': BuildExtension
