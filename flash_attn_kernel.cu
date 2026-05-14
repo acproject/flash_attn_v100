@@ -376,10 +376,6 @@ __global__ void flash_attn_kernel_fp16(
             m_block = fmaxf(m_block, dot);
         }
 
-        // Warp-level max reduction
-        m_block = warp_reduce_max(m_block);
-        m_block = __shfl_sync(0xffffffff, m_block, 0);
-
         // all blocks masked
         if (m_block == -FLT_MAX) {
             __syncthreads();
@@ -411,10 +407,6 @@ __global__ void flash_attn_kernel_fp16(
                 weighted[d+1] += vf.y * p;
             }
         }
-
-        // Warp-level reduction for beta_sum
-        beta_sum = warp_reduce_sum(beta_sum);
-        beta_sum = __shfl_sync(0xffffffff, beta_sum, 0);
 
         // update status
         for (int d = 0; d < D; ++d) {
