@@ -771,6 +771,225 @@ __global__ void flash_attn_kernel_decode_fp16(
 }
 
 // Decode 模式的 FP32 版本
+// GQA/MQA Decode Kernel 优化版本
+// 特征: 支持 Grouped-Query Attention 和 Multi-Query Attention
+// GQA: H_Q > H_KV, 多个 Q heads 共享一个 KV head
+// MQA: H_Q > 1, H_KV = 1, 所有 Q heads 共享同一个 KV head
+__global__ void flash_attn_kernel_decode_gqa_fp16(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H_Q,      // Q 的 head 数量
+    int H_KV,     // K/V 的 head 数量 (H_KV <= H_Q)
+    int N,        // 当前 K/V 的长度（包含 cache）
+    int D,
+    bool causal,
+    float scale,
+    int cache_len  // 历史 cache 长度（不包含当前 token）
+) {
+    // 每个 block 处理一个 (batch, q_head)
+    int bqh = blockIdx.x;
+    int b = bqh / H_Q;
+    int h_q = bqh % H_Q;
+    
+    // GQA 映射: 计算对应的 KV head
+    // 每个 KV head 被 (H_Q / H_KV) 个 Q heads 共享
+    int h_kv = h_q / (H_Q / H_KV);
+
+    int tid = threadIdx.x;
+    int lane_id = tid % 32;
+
+    // base pointer
+    // Q: [B, H_Q, 1, D]
+    const half* Q_ptr = Q + ((b * H_Q + h_q) * 1 * D);
+    // K/V: [B, H_KV, N, D] - 注意是 H_KV 不是 H_Q
+    const half* K_ptr = K + ((b * H_KV + h_kv) * N * D);
+    const half* V_ptr = V + ((b * H_KV + h_kv) * N * D);
+    // O: [B, H_Q, 1, D]
+    half* O_ptr = O + ((b * H_Q + h_q) * 1 * D);
+
+    // 在线 softmax 状态 (所有线程共享)
+    float m_i = -FLT_MAX;
+    float l_i = 0.f;
+    float acc[MAX_D];
+
+    for (int d = 0; d < D; ++d) acc[d] = 0.f;
+
+    // 加载 Q (只有一个 token) - 所有线程都加载完整的 Q
+    __shared__ half sQ[MAX_D];
+    if (tid < D) {
+        sQ[tid] = Q_ptr[tid];
+    }
+    __syncthreads();
+
+    // 分块处理 K/V (tile size 可以更大，因为 Q 只有一个 token)
+    constexpr int TILE_K_DECODE = 64;  // decode 模式可以用更大的 tile
+    int num_kv_blocks = (N + TILE_K_DECODE - 1) / TILE_K_DECODE;
+
+    __shared__ half sK[TILE_K_DECODE][MAX_D];
+    __shared__ half sV[TILE_K_DECODE][MAX_D];
+
+    for (int block_idx = 0; block_idx < num_kv_blocks; ++block_idx) {
+        int k_start = block_idx * TILE_K_DECODE;
+        int k_len = min(TILE_K_DECODE, N - k_start);
+
+        // 协作加载 K/V
+        int total_elements = k_len * D;
+        for (int idx = tid; idx < total_elements; idx += blockDim.x) {
+            int row = idx / D;
+            int col = idx % D;
+            sK[row][col] = K_ptr[(k_start + row) * D + col];
+            sV[row][col] = V_ptr[(k_start + row) * D + col];
+        }
+        __syncthreads();
+
+        // 计算 attention scores (Q 只有一个 token，所以只需要计算一行)
+        float scores[TILE_K_DECODE];
+        float m_block = -FLT_MAX;
+
+        for (int j = 0; j < k_len; ++j) {
+            int k_idx = k_start + j;
+
+            // causal mask: 在 decode 模式下，Q 的位置是 cache_len
+            if (causal && k_idx > cache_len) {
+                scores[j] = -FLT_MAX;
+                continue;
+            }
+
+            // 计算点积 (使用 warp-level reduction)
+            float dot = 0.0f;
+            #pragma unroll
+            for (int d = lane_id; d < D; d += 32) {
+                dot += __half2float(sQ[d]) * __half2float(sK[j][d]);
+            }
+            
+            // Warp-level reduction
+            dot = warp_reduce_sum(dot);
+            
+            // lane 0 有正确的点积结果
+            if (lane_id == 0) {
+                dot *= scale;
+                scores[j] = dot;
+            }
+            
+            // 广播到所有线程
+            scores[j] = __shfl_sync(0xffffffff, scores[j], 0);
+            m_block = fmaxf(m_block, scores[j]);
+        }
+
+        // Warp-level max reduction
+        m_block = warp_reduce_max(m_block);
+        m_block = __shfl_sync(0xffffffff, m_block, 0);
+
+        // 所有位置都被 mask
+        if (m_block == -FLT_MAX) {
+            __syncthreads();
+            continue;
+        }
+
+        float m_new = fmaxf(m_i, m_block);
+        float alpha = (m_i == -FLT_MAX) ? 0.f : expf(m_i - m_new);
+
+        // 计算加权和 (只有 lane 0 执行)
+        if (lane_id == 0) {
+            float beta_sum = 0.f;
+            float weighted[MAX_D];
+            for (int d = 0; d < D; ++d) {
+                weighted[d] = 0.f;
+            }
+
+            for (int j = 0; j < k_len; ++j) {
+                if (scores[j] == -FLT_MAX) continue;
+
+                float p = expf(scores[j] - m_new);
+                beta_sum += p;
+
+                // 加权累加 V
+                #pragma unroll
+                for (int d = 0; d < D; ++d) {
+                    weighted[d] += __half2float(sV[j][d]) * p;
+                }
+            }
+
+            // 更新状态
+            for (int d = 0; d < D; ++d) {
+                acc[d] = alpha * acc[d] + weighted[d];
+            }
+
+            l_i = alpha * l_i + beta_sum;
+            m_i = m_new;
+        }
+        
+        __syncthreads();
+    }
+
+    // 写回结果 (只有 lane 0 执行)
+    if (tid == 0) {
+        for (int d = 0; d < D; ++d) {
+            O_ptr[d] = __float2half(acc[d] / l_i);
+        }
+    }
+}
+
+// GQA/MQA Decode 模式的 FP32 版本
+torch::Tensor flash_attn_forward_decode_gqa_fp16(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    int cache_len
+) {
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    TORCH_CHECK(q.size(2) == 1, "q sequence length must be 1 for decode mode");
+    
+    // GQA 验证
+    auto H_Q = q.size(1);
+    auto H_KV = k.size(1);
+    TORCH_CHECK(H_KV == v.size(1), "k and v must have same number of heads");
+    TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
+    TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
+
+    auto B = q.size(0);
+    auto N = k.size(2);  // K/V 的长度（包含 cache）
+    auto D = q.size(3);
+
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    TORCH_CHECK(cache_len < N, "cache_len must be less than N");
+
+    auto out = torch::zeros({B, H_Q, 1, D}, q.options());
+
+    // 每个 block 处理一个 (batch, q_head)
+    // 使用 128 或 256 个线程（根据 D 的大小调整）
+    int threads = 128;
+    dim3 grid(B * H_Q);
+    dim3 block(threads);
+
+    float scale = 1.0f / std::sqrt((float)D);
+
+    flash_attn_kernel_decode_gqa_fp16<<<grid, block>>>(
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        B,
+        H_Q,
+        H_KV,
+        N,
+        D,
+        causal,
+        scale,
+        cache_len
+    );
+    
+    return out;
+}
+
 torch::Tensor flash_attn_forward_decode_fp16(
     torch::Tensor q,
     torch::Tensor k,
