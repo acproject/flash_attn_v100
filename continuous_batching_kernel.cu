@@ -75,12 +75,12 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
     // 在线 softmax 状态
     float m_i = -FLT_MAX;
     float l_i = 0.f;
-    float acc[MAX_D];
+    float acc[MAX_D_CB];
 
     for (int d = 0; d < D; ++d) acc[d] = 0.f;
 
     // 加载 Q
-    __shared__ half sQ[MAX_D];
+    __shared__ half sQ[MAX_D_CB];
     if (tid < D) {
         sQ[tid] = Q_ptr[tid];
     }
@@ -90,8 +90,8 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
     constexpr int TILE_K_DECODE = 64;
     int num_kv_blocks = (current_N + TILE_K_DECODE - 1) / TILE_K_DECODE;
 
-    __shared__ half sK[TILE_K_DECODE][MAX_D];
-    __shared__ half sV[TILE_K_DECODE][MAX_D];
+    __shared__ half sK[TILE_K_DECODE][MAX_D_CB];
+    __shared__ half sV[TILE_K_DECODE][MAX_D_CB];
 
     for (int block_idx = 0; block_idx < num_kv_blocks; ++block_idx) {
         int k_start = block_idx * TILE_K_DECODE;
@@ -154,7 +154,7 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
         // 计算加权和 (只有 lane 0 执行)
         if (lane_id == 0) {
             float beta_sum = 0.f;
-            float weighted[MAX_D];
+            float weighted[MAX_D_CB];
             for (int d = 0; d < D; ++d) {
                 weighted[d] = 0.f;
             }
@@ -216,7 +216,7 @@ torch::Tensor flash_attn_forward_continuous_batching_fp16(
 
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_CB, "D must be <= MAX_D_CB(128)");
 
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
 

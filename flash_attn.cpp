@@ -90,6 +90,13 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16_stream(
     bool causal,
     int64_t stream_int);
 
+torch::Tensor flash_attn_forward_continuous_batching_fp16(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor cache_lens,
+    bool causal);
+
 void async_h2d_transfer(
     torch::Tensor dst,
     torch::Tensor src,
@@ -176,6 +183,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_varlen_prefill_fp16", &flash_attn_forward_varlen_prefill_fp16, "Flash Attention Varlen Prefill FP16 (V100)");
     m.def("forward_decode_gqa_fp16_stream", &flash_attn_forward_decode_gqa_fp16_stream, "Flash Attention GQA Decode FP16 with CUDA Stream (V100)");
     m.def("forward_varlen_prefill_fp16_stream", &flash_attn_forward_varlen_prefill_fp16_stream, "Flash Attention Varlen Prefill FP16 with CUDA Stream (V100)");
+    m.def("forward_continuous_batching_fp16", &flash_attn_forward_continuous_batching_fp16, "Flash Attention Continuous Batching FP16 (V100)");
     m.def("async_h2d_transfer", &async_h2d_transfer, "Async Host-to-Device Transfer");
     m.def("alloc_pinned_tensor", &alloc_pinned_tensor, "Allocate Pinned Memory Tensor");
     m.def("pipeline_decode_step", &pipeline_decode_step, "Pipeline Decode Step (compute + transfer overlap)");

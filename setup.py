@@ -6,7 +6,8 @@ setup(
     ext_modules=[
         CUDAExtension('flash_attn_v100', [
             'flash_attn.cpp',
-            'flash_attn_kernel.cu'
+            'flash_attn_kernel.cu',
+            'continuous_batching_kernel.cu'
         ],extra_compile_args={'cxx': ['-O3', '-std=c++17'],
                               'nvcc': [
                                 '-O3', 

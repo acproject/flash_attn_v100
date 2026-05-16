@@ -6,6 +6,7 @@ Continuous Batching 允许不同序列长度的请求动态加入/离开 batch
 import torch
 import time
 from tabulate import tabulate
+import flash_attn_v100
 
 
 def simulate_continuous_batching():
@@ -319,18 +320,62 @@ while True:
     """)
 
 
-if __name__ == '__main__':
-    simulate_continuous_batching()
-    test_continuous_batching_kernel()
-    benchmark_continuous_batching()
-    demo_serving_scenario()
-    show_implementation_details()
-    
+def reference_continuous_batching_decode(q, k, v, cache_lens, causal=True):
+    B, H_Q, _, D = q.shape
+    H_KV = k.size(1)
+    max_N = k.size(2)
+    group = H_Q // H_KV
+    scale = 1.0 / (D ** 0.5)
+
+    out = torch.empty((B, H_Q, 1, D), device=q.device, dtype=torch.float16)
+    for b in range(B):
+        cur_len = int(cache_lens[b].item())
+        current_N = min(cur_len + 1, max_N)
+        for h_q in range(H_Q):
+            h_kv = h_q // group
+            q_vec = q[b, h_q, 0].float()
+            k_mat = k[b, h_kv, :current_N].float()
+            v_mat = v[b, h_kv, :current_N].float()
+            scores = (k_mat @ q_vec) * scale
+            if causal:
+                mask = torch.arange(current_N, device=q.device) > cur_len
+                scores = scores.masked_fill(mask, float("-inf"))
+            probs = torch.softmax(scores, dim=0)
+            out_vec = probs @ v_mat
+            out[b, h_q, 0] = out_vec.half()
+    return out
+
+
+def test_continuous_batching_fp16_correctness():
     print("\n" + "=" * 80)
-    print("Continuous Batching Demo Complete!")
+    print("Testing forward_continuous_batching_fp16 Correctness")
     print("=" * 80)
-    print("\nNext Steps:")
-    print("  1. Compile continuous_batching_kernel.cu")
-    print("  2. Add to flash_attn.cpp bindings")
-    print("  3. Test with real LLM serving workload")
-    print("  4. Integrate with vLLM or TGI")
+
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping.")
+        return True
+
+    torch.manual_seed(0)
+    B, H_Q, H_KV, D = 3, 8, 2, 64
+    max_N = 17
+    cache_lens = torch.tensor([0, 3, 15], device="cuda", dtype=torch.int32)
+
+    q = torch.randn(B, H_Q, 1, D, device="cuda", dtype=torch.float16).contiguous()
+    k = torch.randn(B, H_KV, max_N, D, device="cuda", dtype=torch.float16).contiguous()
+    v = torch.randn(B, H_KV, max_N, D, device="cuda", dtype=torch.float16).contiguous()
+
+    ok = True
+    for causal in (False, True):
+        out = flash_attn_v100.forward_continuous_batching_fp16(q, k, v, cache_lens, causal)
+        ref = reference_continuous_batching_decode(q, k, v, cache_lens, causal)
+        max_diff = (out.float() - ref.float()).abs().max().item()
+        all_close = torch.allclose(out, ref, atol=1e-2, rtol=1e-2)
+        print(f"  causal={causal} | max_diff={max_diff:.6f} | allclose={all_close}")
+        ok = ok and all_close
+
+    print(f"Result: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+if __name__ == '__main__':
+    test_continuous_batching_fp16_correctness()
