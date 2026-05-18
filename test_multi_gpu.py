@@ -10,7 +10,13 @@ from benchmark import (
     run_tp_benchmark,
     run_tp_end_to_end_benchmark,
 )
-from tensor_parallel import TPDecodeRunner, TensorParallelConfig, TensorParallelDecoder, benchmark_ms
+from tensor_parallel import (
+    TPDecodeRunner,
+    TensorParallelConfig,
+    TensorParallelDecoder,
+    benchmark_ms,
+    cuda_graph_available,
+)
 
 
 TARGET_WORLD_SIZE = 2
@@ -428,6 +434,65 @@ def test_tensor_parallel_paged_decode_correctness():
     return True
 
 
+def test_tensor_parallel_paged_kv_storage_reuse():
+    print("\n" + "=" * 60)
+    print("Test 10B: TP Paged KV Storage Reuse")
+    print("=" * 60)
+
+    if not require_two_v100():
+        return True
+
+    torch.manual_seed(42)
+    B, H_Q, H_KV, D = 2, 16, 4, 64
+    runner = TPDecodeRunner(
+        TensorParallelConfig(
+            H_Q=H_Q,
+            H_KV=H_KV,
+            D=D,
+            world_size=TARGET_WORLD_SIZE,
+            kv_cache_layout="blocked",
+            kv_cache_page_block_size=16,
+        )
+    )
+    kv_cache = runner.create_kv_cache(B, 48, layout="blocked")
+
+    q_prompt = torch.randn(B, H_Q, 20, D, device="cuda:0", dtype=torch.float16)
+    k_prompt = torch.randn(B, H_KV, 20, D, device="cuda:0", dtype=torch.float16)
+    v_prompt = torch.randn(B, H_KV, 20, D, device="cuda:0", dtype=torch.float16)
+    runner.prefill_to_kv_cache(q_prompt, k_prompt, v_prompt, kv_cache, return_output=False)
+
+    first_paged = kv_cache.build_paged_cache_tensors(compiled_block_size=16)
+    first_ptrs = [(k_pages.data_ptr(), v_pages.data_ptr()) for k_pages, v_pages, _, _, _ in first_paged]
+    first_tables = [block_table.clone() for _, _, block_table, _, _ in first_paged]
+
+    q_step = torch.randn(B, H_Q, 1, D, device="cuda:0", dtype=torch.float16)
+    k_step = torch.randn(B, H_KV, 16, D, device="cuda:0", dtype=torch.float16)
+    v_step = torch.randn(B, H_KV, 16, D, device="cuda:0", dtype=torch.float16)
+    runner.append_to_kv_cache(kv_cache, k_step, v_step)
+
+    second_paged = kv_cache.build_paged_cache_tensors(compiled_block_size=16)
+    second_ptrs = [(k_pages.data_ptr(), v_pages.data_ptr()) for k_pages, v_pages, _, _, _ in second_paged]
+    second_tables = [block_table.clone() for _, _, block_table, _, _ in second_paged]
+
+    active_kv = kv_cache.get_active_kv()
+    out_local = runner.decode_local(q_step, active_kv, kv_cache.current_len - 1, use_workspace=True)
+    out_paged = runner.decode_with_paged_kv_cache(q_step, kv_cache, use_workspace=True)
+    diff = (out_local.float() - out_paged.float()).abs().max().item()
+
+    print(f"  First page pointers: {first_ptrs}")
+    print(f"  Second page pointers: {second_ptrs}")
+    print(f"  Block table before append: {[table.tolist() for table in first_tables]}")
+    print(f"  Block table after append: {[table.tolist() for table in second_tables]}")
+    print(f"  Max diff vs reconstructed contiguous KV: {diff:.8f}")
+    assert first_ptrs == second_ptrs, "paged KV storage should be persistent across decode steps"
+    assert any(
+        not torch.equal(before, after) for before, after in zip(first_tables, second_tables)
+    ), "block table should update in-place as new pages are allocated"
+    assert diff < 1e-2, f"paged KV storage decode diff too large: {diff}"
+    print("  Result: PASS")
+    return True
+
+
 def test_tensor_parallel_benchmark_smoke():
     print("\n" + "=" * 60)
     print("Test 11: TP Benchmark Smoke")
@@ -705,6 +770,73 @@ def test_flash_attn_official_baseline_api_smoke():
     return True
 
 
+def test_tp_cuda_graph_api_smoke():
+    print("\n" + "=" * 60)
+    print("Test 19: TP CUDA Graph API Smoke")
+    print("=" * 60)
+
+    available = cuda_graph_available()
+    print(f"  CUDA Graph available: {available}")
+    assert isinstance(available, bool), "CUDA Graph availability flag should be bool"
+    print("  Result: PASS")
+    return True
+
+
+def test_tensor_parallel_paged_decode_cuda_graph():
+    print("\n" + "=" * 60)
+    print("Test 20: TP Paged Decode CUDA Graph")
+    print("=" * 60)
+
+    if not require_two_v100():
+        return True
+    if not cuda_graph_available():
+        print("  Skipping: CUDA Graph is not available")
+        return True
+
+    torch.manual_seed(42)
+    B, H_Q, H_KV, D = 2, 16, 4, 64
+    config = TensorParallelConfig(
+        H_Q=H_Q,
+        H_KV=H_KV,
+        D=D,
+        world_size=TARGET_WORLD_SIZE,
+        kv_cache_layout="blocked",
+        kv_cache_page_block_size=16,
+    )
+    runner = TPDecodeRunner(config)
+    kv_cache_eager = runner.create_kv_cache(B, 64, layout="blocked")
+    kv_cache_graph = runner.create_kv_cache(B, 64, layout="blocked")
+
+    q_prompt = torch.randn(B, H_Q, 24, D, device="cuda:0", dtype=torch.float16)
+    k_prompt = torch.randn(B, H_KV, 24, D, device="cuda:0", dtype=torch.float16)
+    v_prompt = torch.randn(B, H_KV, 24, D, device="cuda:0", dtype=torch.float16)
+    runner.prefill_to_kv_cache(q_prompt, k_prompt, v_prompt, kv_cache_eager, return_output=False)
+    runner.prefill_to_kv_cache(q_prompt, k_prompt, v_prompt, kv_cache_graph, return_output=False)
+
+    bucket = runner.create_paged_decode_cuda_graph_bucket(kv_cache_graph)
+    q_step = torch.randn(B, H_Q, 1, D, device="cuda:0", dtype=torch.float16)
+    out_eager = runner.decode_with_paged_kv_cache(q_step, kv_cache_eager, use_workspace=True)
+    out_graph = runner.decode_with_paged_kv_cache_graph(q_step, kv_cache_graph, bucket)
+    diff = (out_eager.float() - out_graph.float()).abs().max().item()
+    print(f"  Max diff eager vs graph: {diff:.8f}")
+    assert diff < 1e-2, f"graph decode diff too large: {diff}"
+
+    k_next = torch.randn(B, H_KV, 1, D, device="cuda:0", dtype=torch.float16)
+    v_next = torch.randn(B, H_KV, 1, D, device="cuda:0", dtype=torch.float16)
+    q_next = torch.randn(B, H_Q, 1, D, device="cuda:0", dtype=torch.float16)
+    out_eager_next = runner.decode_with_paged_kv_cache(q_next, kv_cache_eager, new_k=k_next, new_v=v_next, use_workspace=True)
+    out_graph_next = runner.decode_with_paged_kv_cache_graph(q_next, kv_cache_graph, bucket, new_k=k_next, new_v=v_next)
+    diff_next = (out_eager_next.float() - out_graph_next.float()).abs().max().item()
+    stats = runner.get_runtime_stats()
+    print(f"  Max diff eager vs graph after append: {diff_next:.8f}")
+    print(f"  Runtime stats: graph_replay_calls={stats['decode_graph_replay_calls']}, graph_captures={stats['decode_graph_capture_count']}")
+    assert diff_next < 1e-2, f"graph decode diff after append too large: {diff_next}"
+    assert stats["decode_graph_replay_calls"] >= 2, "graph replay count should be tracked"
+    assert stats["decode_graph_capture_count"] >= 1, "graph capture count should be tracked"
+    print("  Result: PASS")
+    return True
+
+
 if __name__ == "__main__":
     results = []
     results.append(("Scatter/Gather Heads", test_scatter_gather_heads()))
@@ -717,6 +849,7 @@ if __name__ == "__main__":
     results.append(("TP KV Cache Auto Grow/Stats", test_tensor_parallel_kv_cache_auto_grow_and_stats()))
     results.append(("TP KV Block Metadata", test_tensor_parallel_block_metadata()))
     results.append(("TP Paged Decode", test_tensor_parallel_paged_decode_correctness()))
+    results.append(("TP Paged KV Storage Reuse", test_tensor_parallel_paged_kv_storage_reuse()))
     results.append(("TP Benchmark Smoke", test_tensor_parallel_benchmark_smoke()))
     results.append(("TP End-to-End Benchmark Smoke", test_tensor_parallel_end_to_end_benchmark_smoke()))
     results.append(("TP World Size Correctness", test_tensor_parallel_world_size_correctness()))
@@ -725,6 +858,8 @@ if __name__ == "__main__":
     results.append(("TP Prefill Scaling", test_tensor_parallel_prefill_scaling()))
     results.append(("TP Profiler API Smoke", test_tp_profiler_api_smoke()))
     results.append(("FlashAttention Official Baseline API Smoke", test_flash_attn_official_baseline_api_smoke()))
+    results.append(("TP CUDA Graph API Smoke", test_tp_cuda_graph_api_smoke()))
+    results.append(("TP Paged Decode CUDA Graph", test_tensor_parallel_paged_decode_cuda_graph()))
 
     print("\n" + "=" * 60)
     print("Summary")

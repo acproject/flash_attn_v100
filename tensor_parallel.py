@@ -41,7 +41,18 @@ class TPRuntimeStats:
     last_paged_decode_ms: float = 0.0
     last_prefill_ms: float = 0.0
     last_kv_append_ms: float = 0.0
+    decode_graph_replay_calls: int = 0
+    decode_graph_capture_count: int = 0
+    last_graph_bucket_seq_len: int = 0
     last_operation: str = "init"
+
+
+def cuda_graph_available():
+    return (
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "CUDAGraph")
+        and hasattr(torch.cuda, "graph")
+    )
 
 
 def available_devices(world_size=None):
@@ -112,6 +123,20 @@ class TensorParallelWorkspace:
         return True
 
 
+@dataclass
+class TPCUDAGraphDecodeBucket:
+    kv_cache: "TensorParallelKVCache"
+    batch_size: int
+    max_seq_len: int
+    dtype: torch.dtype
+    workspace: TensorParallelWorkspace
+    graphs: list
+    local_outputs: list
+    storage_ptrs: list
+    metadata_ptrs: list
+    layout: str = "blocked"
+
+
 class TensorParallelKVCache:
     def __init__(
         self,
@@ -132,18 +157,41 @@ class TensorParallelKVCache:
         self.growth_factor = growth_factor
         self.page_block_size = page_block_size
         self.layout = layout
-        self.local_kv = decoder.allocate_local_kv_cache(batch_size, max_seq_len, dtype=dtype)
         self.current_len = 0
         self.grow_count = 0
         self.tokens_per_block = page_block_size if page_block_size > 0 else max_seq_len
         self.num_blocks = self._capacity_to_blocks(max_seq_len)
+        self.total_physical_blocks = batch_size * self.num_blocks if layout == "blocked" else self.num_blocks
+        if layout == "blocked":
+            self.local_kv = decoder.allocate_blocked_local_kv_cache(
+                self.total_physical_blocks,
+                self.tokens_per_block,
+                dtype=dtype,
+            )
+            self.block_table_tensors = [
+                torch.full((batch_size, self.num_blocks), -1, device=device, dtype=torch.int32)
+                for device in decoder.devices
+            ]
+            self.seq_lens_tensors = [
+                torch.zeros((batch_size,), device=device, dtype=torch.int32)
+                for device in decoder.devices
+            ]
+            self.free_block_ids = list(range(self.total_physical_blocks))
+        else:
+            self.local_kv = decoder.allocate_local_kv_cache(batch_size, max_seq_len, dtype=dtype)
+            self.block_table_tensors = None
+            self.seq_lens_tensors = None
+            self.free_block_ids = []
         self.block_table = [[] for _ in range(batch_size)]
-        self.physical_block_ids = list(range(self.num_blocks))
+        self.physical_block_ids = list(range(self.total_physical_blocks))
         self.allocated_block_count = 0
         self._refresh_block_table()
 
     def reset(self):
         self.current_len = 0
+        if self.layout == "blocked":
+            self.block_table = [[] for _ in range(self.batch_size)]
+            self.free_block_ids = list(range(self.total_physical_blocks))
         self._refresh_block_table()
 
     def _capacity_to_blocks(self, seq_len):
@@ -158,12 +206,26 @@ class TensorParallelKVCache:
 
     def _refresh_block_table(self):
         used_blocks = self._used_blocks(self.current_len)
-        self.allocated_block_count = used_blocks
         if self.layout == "blocked":
-            active_blocks = self.physical_block_ids[:used_blocks]
-            self.block_table = [list(active_blocks) for _ in range(self.batch_size)]
+            self.block_table = [row[:used_blocks] for row in self.block_table]
+            allocated_ids = sorted({block_id for row in self.block_table for block_id in row})
+            self.allocated_block_count = len(allocated_ids)
         else:
+            self.allocated_block_count = used_blocks
             self.block_table = [[] for _ in range(self.batch_size)]
+        self._sync_paged_metadata_tensors()
+
+    def _sync_paged_metadata_tensors(self):
+        if self.layout != "blocked":
+            return
+        for block_table_tensor, seq_lens_tensor in zip(self.block_table_tensors, self.seq_lens_tensors):
+            block_table_tensor.fill_(-1)
+            for batch_idx, row in enumerate(self.block_table):
+                if row:
+                    block_table_tensor[batch_idx, :len(row)].copy_(
+                        torch.tensor(row, device=block_table_tensor.device, dtype=torch.int32)
+                    )
+            seq_lens_tensor.fill_(self.current_len)
 
     def _next_capacity(self, required_len):
         grown = max(required_len, int(max(self.max_seq_len, 1) * self.growth_factor))
@@ -175,18 +237,48 @@ class TensorParallelKVCache:
         if new_max_seq_len <= self.max_seq_len:
             return False
 
-        new_local_kv = self.decoder.allocate_local_kv_cache(self.batch_size, new_max_seq_len, dtype=self.dtype)
-        for rank, (new_k, new_v) in enumerate(new_local_kv):
-            old_k, old_v = self.local_kv[rank]
-            if self.current_len > 0:
-                new_k[:, :, :self.current_len].copy_(old_k[:, :, :self.current_len])
-                new_v[:, :, :self.current_len].copy_(old_v[:, :, :self.current_len])
+        if self.layout == "blocked":
+            new_num_blocks = self._capacity_to_blocks(new_max_seq_len)
+            new_total_physical_blocks = self.batch_size * new_num_blocks
+            new_local_kv = self.decoder.allocate_blocked_local_kv_cache(
+                new_total_physical_blocks,
+                self.tokens_per_block,
+                dtype=self.dtype,
+            )
+            for rank, (new_k, new_v) in enumerate(new_local_kv):
+                old_k, old_v = self.local_kv[rank]
+                new_k[:self.total_physical_blocks].copy_(old_k)
+                new_v[:self.total_physical_blocks].copy_(old_v)
+            self.local_kv = new_local_kv
+            old_total_physical_blocks = self.total_physical_blocks
+            self.max_seq_len = new_max_seq_len
+            self.grow_count += 1
+            self.num_blocks = new_num_blocks
+            self.total_physical_blocks = new_total_physical_blocks
+            self.physical_block_ids = list(range(self.total_physical_blocks))
+            self.free_block_ids.extend(range(old_total_physical_blocks, new_total_physical_blocks))
+            self.block_table_tensors = [
+                torch.full((self.batch_size, self.num_blocks), -1, device=device, dtype=torch.int32)
+                for device in self.decoder.devices
+            ]
+            self.seq_lens_tensors = [
+                torch.full((self.batch_size,), self.current_len, device=device, dtype=torch.int32)
+                for device in self.decoder.devices
+            ]
+        else:
+            new_local_kv = self.decoder.allocate_local_kv_cache(self.batch_size, new_max_seq_len, dtype=self.dtype)
+            for rank, (new_k, new_v) in enumerate(new_local_kv):
+                old_k, old_v = self.local_kv[rank]
+                if self.current_len > 0:
+                    new_k[:, :, :self.current_len].copy_(old_k[:, :, :self.current_len])
+                    new_v[:, :, :self.current_len].copy_(old_v[:, :, :self.current_len])
+            self.local_kv = new_local_kv
+            self.max_seq_len = new_max_seq_len
+            self.grow_count += 1
+            self.num_blocks = self._capacity_to_blocks(new_max_seq_len)
+            self.total_physical_blocks = self.num_blocks
+            self.physical_block_ids = list(range(self.total_physical_blocks))
 
-        self.local_kv = new_local_kv
-        self.max_seq_len = new_max_seq_len
-        self.grow_count += 1
-        self.num_blocks = self._capacity_to_blocks(new_max_seq_len)
-        self.physical_block_ids = list(range(self.num_blocks))
         self._refresh_block_table()
         return True
 
@@ -200,16 +292,63 @@ class TensorParallelKVCache:
                 raise RuntimeError("KV cache is full")
             self.grow(self._next_capacity(next_len))
 
-        for rank, (src_k, src_v) in enumerate(local_kv_shards):
-            dst_k, dst_v = self.local_kv[rank]
-            dst_k[:, :, self.current_len:next_len].copy_(src_k)
-            dst_v[:, :, self.current_len:next_len].copy_(src_v)
+        if self.layout == "blocked":
+            used_blocks_after = self._used_blocks(next_len)
+            for batch_idx in range(self.batch_size):
+                while len(self.block_table[batch_idx]) < used_blocks_after:
+                    if not self.free_block_ids:
+                        raise RuntimeError("paged KV cache has no free blocks")
+                    self.block_table[batch_idx].append(self.free_block_ids.pop(0))
+
+            token_offset = 0
+            while token_offset < step_len:
+                absolute_pos = self.current_len + token_offset
+                logical_block = absolute_pos // self.tokens_per_block
+                block_offset = absolute_pos % self.tokens_per_block
+                chunk_len = min(step_len - token_offset, self.tokens_per_block - block_offset)
+
+                for rank, (src_k, src_v) in enumerate(local_kv_shards):
+                    k_pages, v_pages = self.local_kv[rank]
+                    for batch_idx in range(self.batch_size):
+                        physical_block = self.block_table[batch_idx][logical_block]
+                        k_pages[physical_block, :, block_offset:block_offset + chunk_len].copy_(
+                            src_k[batch_idx, :, token_offset:token_offset + chunk_len]
+                        )
+                        v_pages[physical_block, :, block_offset:block_offset + chunk_len].copy_(
+                            src_v[batch_idx, :, token_offset:token_offset + chunk_len]
+                        )
+                token_offset += chunk_len
+        else:
+            for rank, (src_k, src_v) in enumerate(local_kv_shards):
+                dst_k, dst_v = self.local_kv[rank]
+                dst_k[:, :, self.current_len:next_len].copy_(src_k)
+                dst_v[:, :, self.current_len:next_len].copy_(src_v)
         self.current_len = next_len
         self._refresh_block_table()
 
     def get_active_kv(self):
         if self.current_len <= 0:
             raise RuntimeError("KV cache is empty")
+        if self.layout == "blocked":
+            active_kv = []
+            for k_pages, v_pages in self.local_kv:
+                local_h_kv = k_pages.size(1)
+                D = k_pages.size(3)
+                local_k = torch.empty(
+                    self.batch_size, local_h_kv, self.current_len, D, device=k_pages.device, dtype=self.dtype
+                )
+                local_v = torch.empty_like(local_k)
+                for batch_idx in range(self.batch_size):
+                    for logical_block, physical_block in enumerate(self.block_table[batch_idx]):
+                        start = logical_block * self.tokens_per_block
+                        end = min(start + self.tokens_per_block, self.current_len)
+                        valid_tokens = end - start
+                        if valid_tokens <= 0:
+                            continue
+                        local_k[batch_idx, :, start:end].copy_(k_pages[physical_block, :, :valid_tokens])
+                        local_v[batch_idx, :, start:end].copy_(v_pages[physical_block, :, :valid_tokens])
+                active_kv.append((local_k, local_v))
+            return active_kv
         return [
             (
                 local_k[:, :, :self.current_len].contiguous(),
@@ -231,6 +370,7 @@ class TensorParallelKVCache:
             "page_block_size": self.page_block_size,
             "tokens_per_block": self.tokens_per_block,
             "num_blocks": self.num_blocks,
+            "total_physical_blocks": self.total_physical_blocks,
             "allocated_block_count": self.allocated_block_count,
             "auto_grow": self.auto_grow,
             "grow_count": self.grow_count,
@@ -241,6 +381,7 @@ class TensorParallelKVCache:
             "layout": self.layout,
             "tokens_per_block": self.tokens_per_block,
             "num_blocks": self.num_blocks,
+            "total_physical_blocks": self.total_physical_blocks,
             "allocated_block_count": self.allocated_block_count,
             "physical_block_ids": list(self.physical_block_ids),
             "block_table": [list(row) for row in self.block_table],
@@ -257,41 +398,29 @@ class TensorParallelKVCache:
             )
         if self.current_len <= 0:
             raise RuntimeError("KV cache is empty")
-
-        used_blocks = self._used_blocks(self.current_len)
-        max_num_blocks = max(1, used_blocks)
-        paged_rank_caches = []
-
-        for local_k, local_v in self.local_kv:
-            device = local_k.device
-            local_h_kv = local_k.size(1)
-            D = local_k.size(3)
-            total_pages = self.batch_size * max_num_blocks
-
-            k_pages = torch.zeros(
-                total_pages, local_h_kv, compiled_block_size, D, device=device, dtype=self.dtype
+        self._sync_paged_metadata_tensors()
+        return [
+            (k_pages, v_pages, block_table, seq_lens, self.num_blocks)
+            for (k_pages, v_pages), block_table, seq_lens in zip(
+                self.local_kv, self.block_table_tensors, self.seq_lens_tensors
             )
-            v_pages = torch.zeros_like(k_pages)
-            block_table = torch.full(
-                (self.batch_size, max_num_blocks), -1, device=device, dtype=torch.int32
-            )
-            seq_lens = torch.full((self.batch_size,), self.current_len, device=device, dtype=torch.int32)
+        ]
 
-            for b in range(self.batch_size):
-                for block_idx in range(used_blocks):
-                    physical_block = b * max_num_blocks + block_idx
-                    block_table[b, block_idx] = physical_block
-                    start = block_idx * compiled_block_size
-                    end = min(start + compiled_block_size, self.current_len)
-                    valid_tokens = end - start
-                    if valid_tokens <= 0:
-                        continue
-                    k_pages[physical_block, :, :valid_tokens].copy_(local_k[b, :, start:end])
-                    v_pages[physical_block, :, :valid_tokens].copy_(local_v[b, :, start:end])
+    def paged_storage_ptrs(self):
+        if self.layout != "blocked":
+            return []
+        return [
+            (k_pages.data_ptr(), v_pages.data_ptr())
+            for k_pages, v_pages in self.local_kv
+        ]
 
-            paged_rank_caches.append((k_pages, v_pages, block_table, seq_lens, max_num_blocks))
-
-        return paged_rank_caches
+    def paged_metadata_ptrs(self):
+        if self.layout != "blocked":
+            return []
+        return [
+            (block_table.data_ptr(), seq_lens.data_ptr())
+            for block_table, seq_lens in zip(self.block_table_tensors, self.seq_lens_tensors)
+        ]
 
 
 class TensorParallelDecoder:
@@ -370,6 +499,14 @@ class TensorParallelDecoder:
         for device in self.devices:
             local_k = torch.zeros(B, self.local_H_KV, max_seq_len, self.D, device=device, dtype=dtype)
             local_v = torch.zeros(B, self.local_H_KV, max_seq_len, self.D, device=device, dtype=dtype)
+            caches.append((local_k, local_v))
+        return caches
+
+    def allocate_blocked_local_kv_cache(self, total_blocks, tokens_per_block, dtype=torch.float16):
+        caches = []
+        for device in self.devices:
+            local_k = torch.zeros(total_blocks, self.local_H_KV, tokens_per_block, self.D, device=device, dtype=dtype)
+            local_v = torch.zeros_like(local_k)
             caches.append((local_k, local_v))
         return caches
 
@@ -475,6 +612,7 @@ class TPDecodeRunner:
         )
         self.workspace = None
         self.prefill_workspace = None
+        self.decode_graph_buckets = []
         self.stats = TPRuntimeStats()
 
     def _check_qkv(self, q, k, v, decode_mode):
@@ -686,6 +824,129 @@ class TPDecodeRunner:
         self.stats.last_paged_decode_ms = (time.perf_counter() - start) * 1000.0
         self.stats.last_operation = "decode_paged"
         return out
+
+    def supports_cuda_graph_decode(self, kv_cache: TensorParallelKVCache):
+        return (
+            cuda_graph_available()
+            and kv_cache.decoder is self.decoder
+            and kv_cache.layout == "blocked"
+            and kv_cache.supports_paged_decode(compiled_block_size=16)
+            and kv_cache.current_len > 0
+        )
+
+    def create_paged_decode_cuda_graph_bucket(self, kv_cache: TensorParallelKVCache, q_dtype=None):
+        q_dtype = q_dtype or self.config.dtype
+        self._check_kv_cache(kv_cache, kv_cache.batch_size, q_dtype)
+        if not self.supports_cuda_graph_decode(kv_cache):
+            raise RuntimeError("paged decode CUDA Graph is not available for the given kv_cache/runtime state")
+        if kv_cache.current_len <= 0:
+            raise RuntimeError("paged decode CUDA Graph requires a non-empty kv_cache")
+
+        paged_kv_caches = kv_cache.build_paged_cache_tensors(compiled_block_size=16)
+        workspace = self.decoder.create_workspace(
+            kv_cache.batch_size,
+            kv_cache.max_seq_len,
+            q_seq_len=1,
+            dtype=q_dtype,
+            include_kv=False,
+        )
+        local_q_shards = workspace.local_q_shards
+        for local_q in local_q_shards:
+            local_q.zero_()
+
+        graphs = []
+        local_outputs = []
+        for rank, device in enumerate(self.decoder.devices):
+            local_q = local_q_shards[rank]
+            k_pages, v_pages, block_table, seq_lens, max_num_blocks = paged_kv_caches[rank]
+            capture_stream = torch.cuda.Stream(device=device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.device(device):
+                torch.cuda.synchronize(device)
+                with torch.cuda.stream(capture_stream):
+                    _ = flash_attn_v100.forward_paged_decode_gqa_fp16(
+                        local_q, k_pages, v_pages, block_table, seq_lens, max_num_blocks
+                    )
+                capture_stream.synchronize()
+                torch.cuda.synchronize(device)
+                with torch.cuda.graph(graph, stream=capture_stream):
+                    local_out = flash_attn_v100.forward_paged_decode_gqa_fp16(
+                        local_q, k_pages, v_pages, block_table, seq_lens, max_num_blocks
+                    )
+            graphs.append(graph)
+            local_outputs.append(local_out)
+
+        bucket = TPCUDAGraphDecodeBucket(
+            kv_cache=kv_cache,
+            batch_size=kv_cache.batch_size,
+            max_seq_len=kv_cache.max_seq_len,
+            dtype=q_dtype,
+            workspace=workspace,
+            graphs=graphs,
+            local_outputs=local_outputs,
+            storage_ptrs=kv_cache.paged_storage_ptrs(),
+            metadata_ptrs=kv_cache.paged_metadata_ptrs(),
+            layout=kv_cache.layout,
+        )
+        self.decode_graph_buckets.append(bucket)
+        self.stats.decode_graph_capture_count += 1
+        self.stats.last_graph_bucket_seq_len = kv_cache.max_seq_len
+        self.stats.last_operation = "create_decode_graph_bucket"
+        return bucket
+
+    def _validate_decode_graph_bucket(self, bucket: TPCUDAGraphDecodeBucket, kv_cache: TensorParallelKVCache, q):
+        if bucket.kv_cache is not kv_cache:
+            raise ValueError("decode graph bucket is bound to a different kv_cache")
+        if kv_cache.max_seq_len != bucket.max_seq_len:
+            raise ValueError("kv_cache capacity changed after CUDA Graph capture")
+        if kv_cache.layout != bucket.layout:
+            raise ValueError("kv_cache layout changed after CUDA Graph capture")
+        if kv_cache.paged_storage_ptrs() != bucket.storage_ptrs:
+            raise ValueError("paged KV storage pointers changed after CUDA Graph capture")
+        if kv_cache.paged_metadata_ptrs() != bucket.metadata_ptrs:
+            raise ValueError("paged KV metadata pointers changed after CUDA Graph capture")
+        if q.size(0) != bucket.batch_size:
+            raise ValueError("batch size does not match CUDA Graph bucket")
+        if q.dtype != bucket.dtype:
+            raise ValueError("q dtype does not match CUDA Graph bucket")
+
+    def decode_with_paged_kv_cache_graph(
+        self,
+        q,
+        kv_cache: TensorParallelKVCache,
+        bucket: TPCUDAGraphDecodeBucket,
+        new_k=None,
+        new_v=None,
+        out=None,
+    ):
+        if q.dim() != 4 or q.size(2) != 1:
+            raise ValueError("paged decode graph expects q to have shape [B, H_Q, 1, D]")
+        if new_k is not None or new_v is not None:
+            if new_k is None or new_v is None:
+                raise ValueError("new_k and new_v must be provided together")
+            self.append_to_kv_cache(kv_cache, new_k, new_v)
+        self._check_kv_cache(kv_cache, q.size(0), q.dtype)
+        if not self.supports_cuda_graph_decode(kv_cache):
+            raise RuntimeError("paged decode CUDA Graph is not available for the given kv_cache/runtime state")
+        self._validate_decode_graph_bucket(bucket, kv_cache, q)
+        kv_cache._sync_paged_metadata_tensors()
+        self.decoder.shard_q(q, workspace=bucket.workspace)
+        start = time.perf_counter()
+        for graph in bucket.graphs:
+            graph.replay()
+        synchronize_devices(self.decoder.devices)
+        graph_output = self.decoder.gather_local_outputs(bucket.local_outputs, workspace=bucket.workspace)
+        self.stats.decode_graph_replay_calls += 1
+        self.stats.decode_paged_calls += 1
+        self.stats.last_cache_len = kv_cache.current_len
+        self.stats.last_kv_cache_capacity = kv_cache.max_seq_len
+        self.stats.last_graph_bucket_seq_len = bucket.max_seq_len
+        self.stats.last_paged_decode_ms = (time.perf_counter() - start) * 1000.0
+        self.stats.last_operation = "decode_paged_graph"
+        if out is not None:
+            out.copy_(graph_output)
+            return out
+        return graph_output
 
     def get_runtime_stats(self):
         stats_dict = asdict(self.stats)
