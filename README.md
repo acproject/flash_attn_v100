@@ -347,7 +347,7 @@ out = tp.decode_step_local(q, kv_caches, cache_len)  # Multi-GPU decode with loc
 ### 长期
 - [x] Speculative Decoding (GPU验证内核比CPU快17x, 端到端加速1.9x)
 - [x] KV Cache 压缩 (INT8 KV Cache内存省49%/decode快1.6x, 滑动窗口加速3.5-5.7x, Token驱逐)
-- [ ] 多 GPU 分布式推理 (Tensor Parallel, 2xV100 KV内存省50%, 长序列prefill接近0.85x)
+- [x] 多 GPU 分布式推理 (Tensor Parallel, 2xV100 KV内存省50%, 长序列prefill扩展效率0.92-0.96x)
 
 ## 📚 相关资源
 

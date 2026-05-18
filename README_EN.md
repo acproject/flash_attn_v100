@@ -245,7 +245,7 @@ flash_attn_v100.forward_continuous_batching_fp16(q, k, v, cache_lens, causal)
 ### Long-term
 - [ ] Speculative Decoding
 - [ ] KV Cache compression
-- [ ] Multi-GPU distributed inference
+- [x] Multi-GPU distributed inference (Tensor Parallel, 2xV100 KV cache saves 50% per GPU, long-sequence prefill scaling efficiency reaches 0.92-0.96x)
 
 ## 📚 Related Resources
 
