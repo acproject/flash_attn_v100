@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -14,6 +15,19 @@ using namespace nvcuda;
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be a contiguous tensor")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+#define CHECK_DIM(x, expected_dim) TORCH_CHECK(x.dim() == expected_dim, #x " must be a " #expected_dim "D tensor")
+#define CHECK_SAME_DEVICE(x, y) TORCH_CHECK(x.device() == y.device(), #x " and " #y " must be on the same device")
+#define CHECK_SAME_DTYPE(x, y) TORCH_CHECK(x.dtype() == y.dtype(), #x " and " #y " must have the same dtype")
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err__ = (call); \
+        TORCH_CHECK(err__ == cudaSuccess, #call " failed: ", cudaGetErrorString(err__)); \
+    } while (0)
+#define CUDA_KERNEL_CHECK() \
+    do { \
+        cudaError_t err__ = cudaGetLastError(); \
+        TORCH_CHECK(err__ == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err__)); \
+    } while (0)
 
 // 配置参数
 constexpr int TILE_Q = 32;
@@ -23,6 +37,110 @@ constexpr int WARP_SIZE = 32;
 constexpr int WARPS_PER_BLOCK = 8;
 constexpr int QUERIES_PER_BLOCK = WARPS_PER_BLOCK;
 constexpr int WARP_BLOCK_SIZE = WARPS_PER_BLOCK * WARP_SIZE;
+
+inline void check_same_shape(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const char* a_name,
+    const char* b_name
+) {
+    TORCH_CHECK(a.sizes() == b.sizes(), a_name, " and ", b_name, " must have the same shape");
+}
+
+inline void check_mha_input_shapes(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v
+) {
+    CHECK_DIM(q, 4);
+    CHECK_DIM(k, 4);
+    CHECK_DIM(v, 4);
+    CHECK_SAME_DEVICE(q, k);
+    CHECK_SAME_DEVICE(q, v);
+    CHECK_SAME_DTYPE(q, k);
+    CHECK_SAME_DTYPE(q, v);
+    check_same_shape(q, k, "q", "k");
+    check_same_shape(q, v, "q", "v");
+}
+
+inline void check_decode_mha_input_shapes(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v
+) {
+    CHECK_DIM(q, 4);
+    CHECK_DIM(k, 4);
+    CHECK_DIM(v, 4);
+    CHECK_SAME_DEVICE(q, k);
+    CHECK_SAME_DEVICE(q, v);
+    CHECK_SAME_DTYPE(q, k);
+    CHECK_SAME_DTYPE(q, v);
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "q, k, v batch size must match");
+    TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1), "q, k, v head count must match");
+    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "q, k, v head dimension must match");
+    TORCH_CHECK(k.size(2) == v.size(2), "k and v sequence length must match");
+}
+
+inline void check_prefill_gqa_input_shapes(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v
+) {
+    CHECK_DIM(q, 4);
+    CHECK_DIM(k, 4);
+    CHECK_DIM(v, 4);
+    CHECK_SAME_DEVICE(q, k);
+    CHECK_SAME_DEVICE(q, v);
+    CHECK_SAME_DTYPE(q, k);
+    CHECK_SAME_DTYPE(q, v);
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "q, k, v batch size must match");
+    TORCH_CHECK(k.size(1) == v.size(1), "k and v must have the same number of heads");
+    TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2), "q, k, v sequence length must match");
+    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "q, k, v head dimension must match");
+}
+
+inline void check_decode_gqa_input_shapes(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v
+) {
+    CHECK_DIM(q, 4);
+    CHECK_DIM(k, 4);
+    CHECK_DIM(v, 4);
+    CHECK_SAME_DEVICE(q, k);
+    CHECK_SAME_DEVICE(q, v);
+    CHECK_SAME_DTYPE(q, k);
+    CHECK_SAME_DTYPE(q, v);
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "q, k, v batch size must match");
+    TORCH_CHECK(k.size(1) == v.size(1), "k and v must have the same number of heads");
+    TORCH_CHECK(k.size(2) == v.size(2), "k and v sequence length must match");
+    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "q, k, v head dimension must match");
+}
+
+inline void check_varlen_prefill_input_shapes(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& cu_seqlens
+) {
+    CHECK_DIM(q, 3);
+    CHECK_DIM(k, 3);
+    CHECK_DIM(v, 3);
+    CHECK_DIM(cu_seqlens, 1);
+    CHECK_SAME_DEVICE(q, k);
+    CHECK_SAME_DEVICE(q, v);
+    CHECK_SAME_DEVICE(q, cu_seqlens);
+    CHECK_SAME_DTYPE(q, k);
+    CHECK_SAME_DTYPE(q, v);
+    TORCH_CHECK(k.size(0) == q.size(0) && v.size(0) == q.size(0), "k and v total length must match q");
+    TORCH_CHECK(k.size(1) == q.size(1) && v.size(1) == q.size(1), "k and v head count must match q");
+    TORCH_CHECK(k.size(2) == q.size(2) && v.size(2) == q.size(2), "k and v head dimension must match q");
+}
+
+inline void check_cache_len(int cache_len, int64_t seq_len) {
+    TORCH_CHECK(cache_len >= 0, "cache_len must be non-negative");
+    TORCH_CHECK(cache_len < seq_len, "cache_len must be less than sequence length");
+}
 
 // process a block (batch, head, q_tile)
 __global__ void flash_attn_kernel(
@@ -168,8 +286,8 @@ torch::Tensor flash_attn_forward(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kFloat32, "q must be float32");
+    check_mha_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kFloat32, "q, k, v must be float32");
 
     auto B = q.size(0);
     auto H = q.size(1);
@@ -178,6 +296,7 @@ torch::Tensor flash_attn_forward(
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
     dim3 qrid((N + TILE_Q -1) / TILE_Q, B * H);
@@ -197,6 +316,7 @@ torch::Tensor flash_attn_forward(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
     return out;
 }
 
@@ -224,13 +344,14 @@ void multi_gpu_allreduce_fp16(
     int threads = 256;
     int blocks = (total_elements + threads - 1) / threads;
 
-    cudaSetDevice(dst_device);
+    CUDA_CHECK(cudaSetDevice(dst_device));
 
     allreduce_sum_kernel<<<blocks, threads>>>(
         reinterpret_cast<half*>(tensor.data_ptr<at::Half>()),
         reinterpret_cast<half*>(tensor.data_ptr<at::Half>()),
         total_elements
     );
+    CUDA_KERNEL_CHECK();
 }
 
 __global__ void cross_gpu_reduce_kernel(
@@ -253,8 +374,10 @@ void cross_gpu_allreduce_fp16(
     TORCH_CHECK(dst_tensor.dtype() == torch::kHalf, "dst must be float16");
     TORCH_CHECK(src_tensor.dtype() == torch::kHalf, "src must be float16");
     TORCH_CHECK(dst_tensor.numel() == src_tensor.numel(), "size mismatch");
+    CHECK_SAME_DEVICE(dst_tensor, src_tensor);
 
     auto total_elements = dst_tensor.numel();
+    c10::cuda::CUDAGuard device_guard(dst_tensor.device());
 
     int threads = 256;
     int blocks = (total_elements + threads - 1) / threads;
@@ -264,6 +387,7 @@ void cross_gpu_allreduce_fp16(
         reinterpret_cast<half*>(src_tensor.data_ptr<at::Half>()),
         total_elements
     );
+    CUDA_KERNEL_CHECK();
 }
 
 __global__ void scatter_heads_kernel(
@@ -333,12 +457,22 @@ void scatter_heads_forward(
     CHECK_INPUT(local_tensor);
     TORCH_CHECK(full_tensor.dtype() == torch::kHalf, "full_tensor must be float16");
     TORCH_CHECK(local_tensor.dtype() == torch::kHalf, "local_tensor must be float16");
+    CHECK_DIM(full_tensor, 4);
+    CHECK_DIM(local_tensor, 4);
+    CHECK_SAME_DEVICE(full_tensor, local_tensor);
 
     auto B = full_tensor.size(0);
     auto N = full_tensor.size(2);
     auto D = full_tensor.size(3);
     auto local_elements = local_tensor.numel();
+    TORCH_CHECK(full_tensor.size(1) == total_heads, "full_tensor head count must match total_heads");
+    TORCH_CHECK(local_tensor.size(1) == local_head_count, "local_tensor head count must match local_head_count");
+    TORCH_CHECK(local_head_start >= 0 && local_head_count >= 0, "head range must be non-negative");
+    TORCH_CHECK(local_head_start + local_head_count <= total_heads, "head range exceeds total_heads");
+    TORCH_CHECK(local_tensor.size(0) == B && local_tensor.size(2) == N && local_tensor.size(3) == D,
+                "local_tensor shape must match full_tensor except for head count");
 
+    c10::cuda::CUDAGuard device_guard(full_tensor.device());
     int threads = 256;
     int blocks = (local_elements + threads - 1) / threads;
 
@@ -352,6 +486,7 @@ void scatter_heads_forward(
         N,
         D
     );
+    CUDA_KERNEL_CHECK();
 }
 
 void gather_heads_forward(
@@ -365,12 +500,22 @@ void gather_heads_forward(
     CHECK_INPUT(local_tensor);
     TORCH_CHECK(full_tensor.dtype() == torch::kHalf, "full_tensor must be float16");
     TORCH_CHECK(local_tensor.dtype() == torch::kHalf, "local_tensor must be float16");
+    CHECK_DIM(full_tensor, 4);
+    CHECK_DIM(local_tensor, 4);
+    CHECK_SAME_DEVICE(full_tensor, local_tensor);
 
     auto B = full_tensor.size(0);
     auto N = full_tensor.size(2);
     auto D = full_tensor.size(3);
     auto local_elements = local_tensor.numel();
+    TORCH_CHECK(full_tensor.size(1) == total_heads, "full_tensor head count must match total_heads");
+    TORCH_CHECK(local_tensor.size(1) == local_head_count, "local_tensor head count must match local_head_count");
+    TORCH_CHECK(local_head_start >= 0 && local_head_count >= 0, "head range must be non-negative");
+    TORCH_CHECK(local_head_start + local_head_count <= total_heads, "head range exceeds total_heads");
+    TORCH_CHECK(local_tensor.size(0) == B && local_tensor.size(2) == N && local_tensor.size(3) == D,
+                "local_tensor shape must match full_tensor except for head count");
 
+    c10::cuda::CUDAGuard device_guard(full_tensor.device());
     int threads = 256;
     int blocks = (local_elements + threads - 1) / threads;
 
@@ -384,6 +529,7 @@ void gather_heads_forward(
         N,
         D
     );
+    CUDA_KERNEL_CHECK();
 }
 
 
@@ -775,8 +921,8 @@ torch::Tensor flash_attn_forward_fp16_warp(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_mha_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
 
     auto B = q.size(0);
     auto H = q.size(1);
@@ -785,6 +931,7 @@ torch::Tensor flash_attn_forward_fp16_warp(
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(64)");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
     dim3 qrid((N + TILE_Q - 1) / TILE_Q, B * H);
@@ -804,6 +951,7 @@ torch::Tensor flash_attn_forward_fp16_warp(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
     
     return out;
 }
@@ -1134,8 +1282,8 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_decode_gqa_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
     TORCH_CHECK(q.size(2) == 1, "q sequence length must be 1 for decode mode");
     
     // GQA 验证
@@ -1150,8 +1298,9 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16(
     auto D = q.size(3);
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
-    TORCH_CHECK(cache_len < N, "cache_len must be less than N");
+    check_cache_len(cache_len, N);
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
 
     // 每个 block 处理一个 (batch, q_head)
@@ -1176,6 +1325,7 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16(
         scale,
         cache_len
     );
+    CUDA_KERNEL_CHECK();
     
     return out;
 }
@@ -1190,8 +1340,8 @@ torch::Tensor flash_attn_forward_decode_fp16(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_decode_mha_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
     TORCH_CHECK(q.size(2) == 1, "q sequence length must be 1 for decode mode");
 
     auto B = q.size(0);
@@ -1200,8 +1350,9 @@ torch::Tensor flash_attn_forward_decode_fp16(
     auto D = q.size(3);
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
-    TORCH_CHECK(cache_len < N, "cache_len must be less than N");
+    check_cache_len(cache_len, N);
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H, 1, D}, q.options());
 
     // 每个 block 处理一个 (batch, head)
@@ -1225,6 +1376,7 @@ torch::Tensor flash_attn_forward_decode_fp16(
         scale,
         cache_len
     );
+    CUDA_KERNEL_CHECK();
     
     return out;
 }
@@ -1238,8 +1390,8 @@ torch::Tensor flash_attn_forward_fp16(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_mha_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
 
     auto B = q.size(0);
     auto H = q.size(1);
@@ -1248,6 +1400,7 @@ torch::Tensor flash_attn_forward_fp16(
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(64)");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
     dim3 qrid((N + TILE_Q - 1) / TILE_Q, B * H);
@@ -1267,6 +1420,7 @@ torch::Tensor flash_attn_forward_fp16(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
     
     return out;
 }
@@ -1439,8 +1593,8 @@ torch::Tensor flash_attn_forward_fp16_wmma(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_mha_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
     TORCH_CHECK(q.size(3) % 16 == 0, "D must be multiple of 16 for WMMA");
 
     auto B = q.size(0);
@@ -1450,6 +1604,7 @@ torch::Tensor flash_attn_forward_fp16_wmma(
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
     dim3 qrid((N + WMMA_Q - 1) / WMMA_Q, B * H);
@@ -1469,6 +1624,7 @@ torch::Tensor flash_attn_forward_fp16_wmma(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
     
     return out;
 } 
@@ -1752,8 +1908,8 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_prefill_gqa_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
 
     auto B = q.size(0);
     auto H_Q = q.size(1);
@@ -1767,6 +1923,7 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16(
     TORCH_CHECK(k.size(2) == N, "k sequence length must match q");
     TORCH_CHECK(v.size(2) == N, "v sequence length must match q");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, N, D}, q.options());
 
     dim3 grid((N + TILE_Q - 1) / TILE_Q, B * H_Q);
@@ -1787,6 +1944,7 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
 
     return out;
 }
@@ -1949,8 +2107,10 @@ torch::Tensor flash_attn_forward_decode_int8_gqa(
     CHECK_INPUT(v);
     CHECK_INPUT(q_scale);
     CHECK_INPUT(k_scale);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_decode_gqa_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
+    TORCH_CHECK(q_scale.dtype() == torch::kFloat32, "q_scale must be float32");
+    TORCH_CHECK(k_scale.dtype() == torch::kFloat32, "k_scale must be float32");
     TORCH_CHECK(q.size(2) == 1, "q sequence length must be 1 for decode mode");
 
     auto B = q.size(0);
@@ -1962,7 +2122,14 @@ torch::Tensor flash_attn_forward_decode_int8_gqa(
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
     TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(q_scale.size(0) == B && q_scale.size(1) == H_Q, "q_scale must be [B, H_Q]");
+    TORCH_CHECK(k_scale.size(0) == B && k_scale.size(1) == H_KV && k_scale.size(2) == N,
+                "k_scale must be [B, H_KV, N]");
+    CHECK_SAME_DEVICE(q, q_scale);
+    CHECK_SAME_DEVICE(q, k_scale);
+    check_cache_len(cache_len, N);
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
 
     int threads = 128;
@@ -1986,6 +2153,7 @@ torch::Tensor flash_attn_forward_decode_int8_gqa(
         scale,
         cache_len
     );
+    CUDA_KERNEL_CHECK();
 
     return out;
 }
@@ -2147,11 +2315,9 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16(
     CHECK_INPUT(k);
     CHECK_INPUT(v);
     CHECK_INPUT(cu_seqlens);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
-    TORCH_CHECK(q.dim() == 3, "q must be [total_q, H, D] for varlen mode");
-    TORCH_CHECK(k.dim() == 3, "k must be [total_kv, H, D] for varlen mode");
-    TORCH_CHECK(v.dim() == 3, "v must be [total_kv, H, D] for varlen mode");
+    check_varlen_prefill_input_shapes(q, k, v, cu_seqlens);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
+    TORCH_CHECK(cu_seqlens.dtype() == torch::kInt32, "cu_seqlens must be int32");
 
     auto total_q = q.size(0);
     auto H = q.size(1);
@@ -2161,7 +2327,10 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16(
     TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
     TORCH_CHECK(k.size(0) == total_q, "k and q must have same total length");
     TORCH_CHECK(v.size(0) == total_q, "v and q must have same total length");
+    TORCH_CHECK(max_seqlen > 0, "max_seqlen must be positive");
+    TORCH_CHECK(batch_size > 0, "cu_seqlens must contain at least one sequence");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
     int num_q_tiles = (max_seqlen + TILE_Q - 1) / TILE_Q;
@@ -2183,6 +2352,7 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
 
     return out;
 }
@@ -2327,10 +2497,20 @@ torch::Tensor flash_attn_forward_paged_decode_gqa_fp16(
     CHECK_INPUT(v_cache);
     CHECK_INPUT(block_table);
     CHECK_INPUT(seq_lens);
-
+    CHECK_DIM(q, 4);
+    CHECK_DIM(k_cache, 4);
+    CHECK_DIM(v_cache, 4);
+    CHECK_DIM(block_table, 2);
+    CHECK_DIM(seq_lens, 1);
+    CHECK_SAME_DEVICE(q, k_cache);
+    CHECK_SAME_DEVICE(q, v_cache);
+    CHECK_SAME_DEVICE(q, block_table);
+    CHECK_SAME_DEVICE(q, seq_lens);
     TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
     TORCH_CHECK(k_cache.dtype() == torch::kHalf, "k_cache must be float16");
     TORCH_CHECK(v_cache.dtype() == torch::kHalf, "v_cache must be float16");
+    TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+    TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
     TORCH_CHECK(q.size(2) == 1, "q sequence length must be 1 for decode mode");
 
     auto B = q.size(0);
@@ -2343,7 +2523,10 @@ torch::Tensor flash_attn_forward_paged_decode_gqa_fp16(
     TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
     TORCH_CHECK(k_cache.size(2) == PAGE_BLOCK_SIZE, "k_cache block size mismatch");
     TORCH_CHECK(v_cache.size(2) == PAGE_BLOCK_SIZE, "v_cache block size mismatch");
+    TORCH_CHECK(block_table.size(0) == B, "block_table batch size must match q");
+    TORCH_CHECK(seq_lens.size(0) == B, "seq_lens batch size must match q");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
 
     int threads = 128;
@@ -2366,6 +2549,7 @@ torch::Tensor flash_attn_forward_paged_decode_gqa_fp16(
         max_num_blocks,
         scale
     );
+    CUDA_KERNEL_CHECK();
 
     return out;
 }
@@ -2379,8 +2563,8 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16_warp(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_prefill_gqa_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
 
     auto B = q.size(0);
     auto H_Q = q.size(1);
@@ -2394,6 +2578,7 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16_warp(
     TORCH_CHECK(k.size(2) == N, "k sequence length must match q");
     TORCH_CHECK(v.size(2) == N, "v sequence length must match q");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, N, D}, q.options());
 
     dim3 grid((N + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK, B * H_Q);
@@ -2414,6 +2599,7 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16_warp(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
 
     return out;
 }
@@ -2429,8 +2615,8 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16_stream(
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_decode_gqa_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
     TORCH_CHECK(q.size(2) == 1, "q sequence length must be 1 for decode mode");
 
     auto H_Q = q.size(1);
@@ -2444,8 +2630,9 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16_stream(
     auto D = q.size(3);
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
-    TORCH_CHECK(cache_len < N, "cache_len must be less than N");
+    check_cache_len(cache_len, N);
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
 
     int threads = 128;
@@ -2470,6 +2657,7 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16_stream(
         scale,
         cache_len
     );
+    CUDA_KERNEL_CHECK();
 
     return out;
 }
@@ -2487,8 +2675,8 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16_stream(
     CHECK_INPUT(k);
     CHECK_INPUT(v);
     CHECK_INPUT(cu_seqlens);
-
-    TORCH_CHECK(q.dtype() == torch::kHalf, "q must be float16");
+    check_varlen_prefill_input_shapes(q, k, v, cu_seqlens);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
     TORCH_CHECK(cu_seqlens.dtype() == torch::kInt32, "cu_seqlens must be int32");
 
     auto total_q = q.size(0);
@@ -2499,7 +2687,10 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16_stream(
     TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
     TORCH_CHECK(k.size(0) == total_q, "k and q must have same total length");
     TORCH_CHECK(v.size(0) == total_q, "v and q must have same total length");
+    TORCH_CHECK(max_seqlen > 0, "max_seqlen must be positive");
+    TORCH_CHECK(batch_size > 0, "cu_seqlens must contain at least one sequence");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
     int num_q_tiles = (max_seqlen + TILE_Q - 1) / TILE_Q;
@@ -2523,6 +2714,7 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16_stream(
         causal,
         scale
     );
+    CUDA_KERNEL_CHECK();
 
     return out;
 }
@@ -2537,17 +2729,20 @@ void async_h2d_transfer(
     TORCH_CHECK(dst.dtype() == src.dtype(), "dtype must match");
     TORCH_CHECK(dst.numel() == src.numel(), "size must match");
     TORCH_CHECK(src.is_pinned(), "src must be pinned memory for async transfer");
+    TORCH_CHECK(dst.is_contiguous(), "dst must be contiguous");
+    TORCH_CHECK(src.is_contiguous(), "src must be contiguous");
 
+    c10::cuda::CUDAGuard device_guard(dst.device());
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_int);
     size_t nbytes = dst.numel() * dst.element_size();
 
-    cudaMemcpyAsync(
+    CUDA_CHECK(cudaMemcpyAsync(
         dst.data_ptr(),
         src.data_ptr(),
         nbytes,
         cudaMemcpyHostToDevice,
         stream
-    );
+    ));
 }
 
 torch::Tensor alloc_pinned_tensor(
@@ -2580,6 +2775,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step(
     CHECK_INPUT(q_compute);
     CHECK_INPUT(k_compute);
     CHECK_INPUT(v_compute);
+    check_decode_gqa_input_shapes(q_compute, k_compute, v_compute);
+    TORCH_CHECK(q_compute.dtype() == torch::kHalf, "q_compute, k_compute, v_compute must be float16");
+    TORCH_CHECK(q_compute.size(2) == 1, "q_compute sequence length must be 1 for decode mode");
 
     auto H_Q = q_compute.size(1);
     auto H_KV = k_compute.size(1);
@@ -2588,7 +2786,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step(
     auto D = q_compute.size(3);
 
     TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    check_cache_len(cache_len, N);
+    TORCH_CHECK(!q_transfer.is_cuda() && !k_transfer.is_cuda() && !v_transfer.is_cuda(),
+                "transfer source tensors must be CPU tensors");
+    TORCH_CHECK(q_transfer.is_pinned() && k_transfer.is_pinned() && v_transfer.is_pinned(),
+                "transfer source tensors must be pinned");
+    TORCH_CHECK(q_h2d_dst.is_cuda() && k_h2d_dst.is_cuda() && v_h2d_dst.is_cuda(),
+                "transfer destination tensors must be CUDA tensors");
+    TORCH_CHECK(q_transfer.dtype() == q_h2d_dst.dtype() &&
+                k_transfer.dtype() == k_h2d_dst.dtype() &&
+                v_transfer.dtype() == v_h2d_dst.dtype(), "transfer tensor dtypes must match");
+    TORCH_CHECK(q_transfer.numel() == q_h2d_dst.numel() &&
+                k_transfer.numel() == k_h2d_dst.numel() &&
+                v_transfer.numel() == v_h2d_dst.numel(), "transfer tensor sizes must match");
+    TORCH_CHECK(q_h2d_dst.device() == q_compute.device() &&
+                k_h2d_dst.device() == q_compute.device() &&
+                v_h2d_dst.device() == q_compute.device(), "transfer destinations must be on compute device");
 
+    c10::cuda::CUDAGuard device_guard(q_compute.device());
     auto out = torch::zeros({B, H_Q, 1, D}, q_compute.options());
 
     cudaStream_t compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_int);
@@ -2613,18 +2828,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step(
         scale,
         cache_len
     );
+    CUDA_KERNEL_CHECK();
 
     if (q_transfer.numel() > 0 && q_h2d_dst.numel() > 0) {
         size_t q_bytes = q_h2d_dst.numel() * q_h2d_dst.element_size();
         size_t k_bytes = k_h2d_dst.numel() * k_h2d_dst.element_size();
         size_t v_bytes = v_h2d_dst.numel() * v_h2d_dst.element_size();
 
-        cudaMemcpyAsync(q_h2d_dst.data_ptr(), q_transfer.data_ptr(), q_bytes,
-                        cudaMemcpyHostToDevice, transfer_stream);
-        cudaMemcpyAsync(k_h2d_dst.data_ptr(), k_transfer.data_ptr(), k_bytes,
-                        cudaMemcpyHostToDevice, transfer_stream);
-        cudaMemcpyAsync(v_h2d_dst.data_ptr(), v_transfer.data_ptr(), v_bytes,
-                        cudaMemcpyHostToDevice, transfer_stream);
+        CUDA_CHECK(cudaMemcpyAsync(q_h2d_dst.data_ptr(), q_transfer.data_ptr(), q_bytes,
+                                   cudaMemcpyHostToDevice, transfer_stream));
+        CUDA_CHECK(cudaMemcpyAsync(k_h2d_dst.data_ptr(), k_transfer.data_ptr(), k_bytes,
+                                   cudaMemcpyHostToDevice, transfer_stream));
+        CUDA_CHECK(cudaMemcpyAsync(v_h2d_dst.data_ptr(), v_transfer.data_ptr(), v_bytes,
+                                   cudaMemcpyHostToDevice, transfer_stream));
     }
 
     return std::make_tuple(out, q_h2d_dst, k_h2d_dst);

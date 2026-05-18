@@ -63,6 +63,44 @@ def main():
     max_diff_32_vs_16 = (out.float() - out_fp16.float()).abs().max().item()
     print('max diff (FP32 vs FP16) =', max_diff_32_vs_16)
 
+    print("\n" + "=" * 50)
+    print("Reliability Checks")
+    print("=" * 50)
+
+    try:
+        flash_attn_v100.forward_fp16(q_fp16.contiguous(),
+                                     k.contiguous(),
+                                     v_fp16.contiguous(),
+                                     True)
+        print("dtype mismatch check = FAILED")
+    except RuntimeError as exc:
+        print("dtype mismatch check = PASS")
+        print("message =", str(exc).splitlines()[0])
+
+    try:
+        flash_attn_v100.forward_decode_gqa_fp16(q_fp16[:, :, :1, :].contiguous(),
+                                                k_fp16.contiguous(),
+                                                v_fp16.contiguous(),
+                                                True,
+                                                -1)
+        print("negative cache_len check = FAILED")
+    except RuntimeError as exc:
+        print("negative cache_len check = PASS")
+        print("message =", str(exc).splitlines()[0])
+
+    if torch.cuda.device_count() >= 2:
+        try:
+            flash_attn_v100.forward_prefill_gqa_fp16(
+                q_fp16.to('cuda:0').contiguous(),
+                k_fp16.to('cuda:1').contiguous(),
+                v_fp16.to('cuda:1').contiguous(),
+                True
+            )
+            print("cross-device check = FAILED")
+        except RuntimeError as exc:
+            print("cross-device check = PASS")
+            print("message =", str(exc).splitlines()[0])
+
 
 if __name__ == '__main__':
     main()
