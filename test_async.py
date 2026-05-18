@@ -2,6 +2,22 @@ import torch
 import time
 import flash_attn_v100
 
+
+class PipelineDecodeWorkspace:
+    def __init__(self, B, H_Q, H_KV, N, D):
+        self.out = torch.empty(B, H_Q, 1, D, device='cuda', dtype=torch.float16)
+        self.q_cpu = flash_attn_v100.alloc_pinned_tensor([B, H_Q, 1, D], 5)
+        self.k_cpu = flash_attn_v100.alloc_pinned_tensor([B, H_KV, N, D], 5)
+        self.v_cpu = flash_attn_v100.alloc_pinned_tensor([B, H_KV, N, D], 5)
+        self.q_dst = torch.empty(B, H_Q, 1, D, device='cuda', dtype=torch.float16)
+        self.k_dst = torch.empty(B, H_KV, N, D, device='cuda', dtype=torch.float16)
+        self.v_dst = torch.empty(B, H_KV, N, D, device='cuda', dtype=torch.float16)
+
+    def load_random_inputs(self, B, H_Q, H_KV, N, D):
+        self.q_cpu.copy_(torch.randn(B, H_Q, 1, D, dtype=torch.float16))
+        self.k_cpu.copy_(torch.randn(B, H_KV, N, D, dtype=torch.float16))
+        self.v_cpu.copy_(torch.randn(B, H_KV, N, D, dtype=torch.float16))
+
 def ref_attention(q, k, v, causal=False):
     q_f = q.float()
     k_f = k.float()
@@ -93,7 +109,7 @@ def test_async_h2d_transfer():
     print("Test 3: Async H2D Transfer")
     print("=" * 60)
 
-    B, H, N, D = 2, 4, 512, 64
+    B, H, D = 2, 4, 64
     torch.manual_seed(42)
 
     q_cpu_pinned = flash_attn_v100.alloc_pinned_tensor(
@@ -150,30 +166,18 @@ def test_pipeline_decode_step():
     k_compute = torch.randn(B, H_KV, N, D, device='cuda', dtype=torch.float16)
     v_compute = torch.randn(B, H_KV, N, D, device='cuda', dtype=torch.float16)
 
-    q_transfer_cpu = flash_attn_v100.alloc_pinned_tensor(
-        [B, H_Q, 1, D], 5
-    )
-    q_transfer_cpu.copy_(torch.randn(B, H_Q, 1, D, dtype=torch.float16))
-    k_transfer_cpu = flash_attn_v100.alloc_pinned_tensor(
-        [B, H_KV, N, D], 5
-    )
-    k_transfer_cpu.copy_(torch.randn(B, H_KV, N, D, dtype=torch.float16))
-    v_transfer_cpu = flash_attn_v100.alloc_pinned_tensor(
-        [B, H_KV, N, D], 5
-    )
-    v_transfer_cpu.copy_(torch.randn(B, H_KV, N, D, dtype=torch.float16))
-
-    q_h2d_dst = torch.zeros(B, H_Q, 1, D, device='cuda', dtype=torch.float16)
-    k_h2d_dst = torch.zeros(B, H_KV, N, D, device='cuda', dtype=torch.float16)
-    v_h2d_dst = torch.zeros(B, H_KV, N, D, device='cuda', dtype=torch.float16)
+    workspace = PipelineDecodeWorkspace(B, H_Q, H_KV, N, D)
+    workspace.load_random_inputs(B, H_Q, H_KV, N, D)
 
     compute_stream = torch.cuda.Stream()
     transfer_stream = torch.cuda.Stream()
 
-    out, q_dst, k_dst = flash_attn_v100.pipeline_decode_step(
+    out_ptr = workspace.out.data_ptr()
+    out, q_dst, k_dst = flash_attn_v100.pipeline_decode_step_out(
+        workspace.out,
         q_compute, k_compute, v_compute,
-        q_transfer_cpu, k_transfer_cpu, v_transfer_cpu,
-        q_h2d_dst, k_h2d_dst, v_h2d_dst,
+        workspace.q_cpu, workspace.k_cpu, workspace.v_cpu,
+        workspace.q_dst, workspace.k_dst, workspace.v_dst,
         True, 0,
         compute_stream.cuda_stream,
         transfer_stream.cuda_stream
@@ -184,17 +188,18 @@ def test_pipeline_decode_step():
     ref_out = flash_attn_v100.forward_decode_gqa_fp16(q_compute, k_compute, v_compute, True, 0)
     out_diff = (out.float() - ref_out.float()).abs().max().item()
 
-    q_ref = q_transfer_cpu.cuda()
+    q_ref = workspace.q_cpu.cuda()
     q_diff = (q_dst.float() - q_ref.float()).abs().max().item()
 
-    k_ref = k_transfer_cpu.cuda()
+    k_ref = workspace.k_cpu.cuda()
     k_diff = (k_dst.float() - k_ref.float()).abs().max().item()
 
     print(f"  Compute output max diff: {out_diff:.8f}")
     print(f"  Q transfer max diff: {q_diff:.8f}")
     print(f"  K transfer max diff: {k_diff:.8f}")
+    print(f"  Output buffer reused: {out.data_ptr() == out_ptr}")
 
-    ok = out_diff < 1e-5 and q_diff < 1e-5 and k_diff < 1e-5
+    ok = out_diff < 1e-5 and q_diff < 1e-5 and k_diff < 1e-5 and out.data_ptr() == out_ptr
     print(f"  Result: {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -213,16 +218,8 @@ def test_pipeline_latency():
     k = torch.randn(B, H_KV, N, D, device='cuda', dtype=torch.float16)
     v = torch.randn(B, H_KV, N, D, device='cuda', dtype=torch.float16)
 
-    q_cpu = flash_attn_v100.alloc_pinned_tensor([B, H_Q, 1, D], 5)
-    q_cpu.copy_(torch.randn(B, H_Q, 1, D, dtype=torch.float16))
-    k_cpu = flash_attn_v100.alloc_pinned_tensor([B, H_KV, N, D], 5)
-    k_cpu.copy_(torch.randn(B, H_KV, N, D, dtype=torch.float16))
-    v_cpu = flash_attn_v100.alloc_pinned_tensor([B, H_KV, N, D], 5)
-    v_cpu.copy_(torch.randn(B, H_KV, N, D, dtype=torch.float16))
-
-    q_dst = torch.zeros_like(q)
-    k_dst = torch.zeros_like(k)
-    v_dst = torch.zeros_like(v)
+    workspace = PipelineDecodeWorkspace(B, H_Q, H_KV, N, D)
+    workspace.load_random_inputs(B, H_Q, H_KV, N, D)
 
     for _ in range(warmup):
         flash_attn_v100.forward_decode_gqa_fp16(q, k, v, True, 0)
@@ -230,10 +227,10 @@ def test_pipeline_latency():
 
     start = time.perf_counter()
     for _ in range(num_iters):
-        out = flash_attn_v100.forward_decode_gqa_fp16(q, k, v, True, 0)
-        q_dst.copy_(q_cpu)
-        k_dst.copy_(k_cpu)
-        v_dst.copy_(v_cpu)
+        flash_attn_v100.forward_decode_gqa_fp16(q, k, v, True, 0)
+        workspace.q_dst.copy_(workspace.q_cpu)
+        workspace.k_dst.copy_(workspace.k_cpu)
+        workspace.v_dst.copy_(workspace.v_cpu)
     torch.cuda.synchronize()
     seq_time = (time.perf_counter() - start) / num_iters * 1000
 
@@ -241,9 +238,10 @@ def test_pipeline_latency():
     transfer_stream = torch.cuda.Stream()
 
     for _ in range(warmup):
-        flash_attn_v100.pipeline_decode_step(
-            q, k, v, q_cpu, k_cpu, v_cpu,
-            q_dst, k_dst, v_dst, True, 0,
+        flash_attn_v100.pipeline_decode_step_out(
+            workspace.out,
+            q, k, v, workspace.q_cpu, workspace.k_cpu, workspace.v_cpu,
+            workspace.q_dst, workspace.k_dst, workspace.v_dst, True, 0,
             compute_stream.cuda_stream,
             transfer_stream.cuda_stream
         )
@@ -251,9 +249,10 @@ def test_pipeline_latency():
 
     start = time.perf_counter()
     for _ in range(num_iters):
-        flash_attn_v100.pipeline_decode_step(
-            q, k, v, q_cpu, k_cpu, v_cpu,
-            q_dst, k_dst, v_dst, True, 0,
+        flash_attn_v100.pipeline_decode_step_out(
+            workspace.out,
+            q, k, v, workspace.q_cpu, workspace.k_cpu, workspace.v_cpu,
+            workspace.q_dst, workspace.k_dst, workspace.v_dst, True, 0,
             compute_stream.cuda_stream,
             transfer_stream.cuda_stream
         )

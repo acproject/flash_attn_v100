@@ -31,6 +31,14 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16(
     bool causal,
     int cache_len);
 
+torch::Tensor flash_attn_forward_decode_gqa_fp16_out(
+    torch::Tensor out,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    int cache_len);
+
 torch::Tensor flash_attn_forward_fp16_wmma(
     torch::Tensor q,
     torch::Tensor k,
@@ -38,6 +46,13 @@ torch::Tensor flash_attn_forward_fp16_wmma(
     bool causal);
 
 torch::Tensor flash_attn_forward_prefill_gqa_fp16(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal);
+
+torch::Tensor flash_attn_forward_prefill_gqa_fp16_out(
+    torch::Tensor out,
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -121,6 +136,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step(
     int64_t compute_stream_int,
     int64_t transfer_stream_int);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step_out(
+    torch::Tensor out,
+    torch::Tensor q_compute,
+    torch::Tensor k_compute,
+    torch::Tensor v_compute,
+    torch::Tensor q_transfer,
+    torch::Tensor k_transfer,
+    torch::Tensor v_transfer,
+    torch::Tensor q_h2d_dst,
+    torch::Tensor k_h2d_dst,
+    torch::Tensor v_h2d_dst,
+    bool causal,
+    int cache_len,
+    int64_t compute_stream_int,
+    int64_t transfer_stream_int);
+
 std::tuple<torch::Tensor, torch::Tensor> speculative_verify_forward(
     torch::Tensor target_probs,
     torch::Tensor draft_probs,
@@ -175,8 +206,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_fp16_warp", &flash_attn_forward_fp16_warp, "Flash Attention Forward FP16 with Warp Reduction (V100)");
     m.def("forward_decode_fp16", &flash_attn_forward_decode_fp16, "Flash Attention Decode FP16 with KV Cache (V100)");
     m.def("forward_decode_gqa_fp16", &flash_attn_forward_decode_gqa_fp16, "Flash Attention GQA/MQA Decode FP16 with KV Cache (V100)");
+    m.def("forward_decode_gqa_fp16_out", &flash_attn_forward_decode_gqa_fp16_out, "Flash Attention GQA/MQA Decode FP16 with user-provided output tensor (V100)");
     m.def("forward_fp16_wmma", &flash_attn_forward_fp16_wmma, "Flash Attention Forward FP16 with WMMA Tensor Core (V100)");
     m.def("forward_prefill_gqa_fp16", &flash_attn_forward_prefill_gqa_fp16, "Flash Attention Prefill GQA/MQA FP16 (V100)");
+    m.def("forward_prefill_gqa_fp16_out", &flash_attn_forward_prefill_gqa_fp16_out, "Flash Attention Prefill GQA/MQA FP16 with user-provided output tensor (V100)");
     m.def("forward_prefill_gqa_fp16_warp", &flash_attn_forward_prefill_gqa_fp16_warp, "Flash Attention Prefill GQA/MQA FP16 with Warp Reduction (V100)");
     m.def("forward_paged_decode_gqa_fp16", &flash_attn_forward_paged_decode_gqa_fp16, "Flash Attention Paged Decode GQA/MQA FP16 (V100)");
     m.def("forward_decode_int8_gqa", &flash_attn_forward_decode_int8_gqa, "Flash Attention Decode INT8 GQA/MQA (V100)");
@@ -187,6 +220,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("async_h2d_transfer", &async_h2d_transfer, "Async Host-to-Device Transfer");
     m.def("alloc_pinned_tensor", &alloc_pinned_tensor, "Allocate Pinned Memory Tensor");
     m.def("pipeline_decode_step", &pipeline_decode_step, "Pipeline Decode Step (compute + transfer overlap)");
+    m.def("pipeline_decode_step_out", &pipeline_decode_step_out, "Pipeline Decode Step with user-provided output tensor (compute + transfer overlap)");
     m.def("speculative_verify", &speculative_verify_forward, "Speculative Decoding Verify (GPU acceptance/rejection)");
     m.def("forward_decode_int8_kv_cache_gqa", &flash_attn_forward_decode_int8_kv_cache_gqa, "Flash Attention Decode with INT8 KV Cache GQA/MQA (V100)");
     m.def("token_eviction", &token_eviction_forward, "Token Eviction based on attention scores");

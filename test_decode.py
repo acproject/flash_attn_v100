@@ -1,6 +1,47 @@
 import torch
 import flash_attn_v100
-import time
+import torch.nn.functional as F
+
+
+PAGE_BLOCK_SIZE = 16
+
+
+def sdpa_decode_reference(q, k, v, seq_lens):
+    q_ref = q.float()
+    k_ref = k.float()
+    v_ref = v.float()
+    B, H, _, max_len = q.size(0), q.size(1), q.size(2), k.size(2)
+    attn_mask = torch.zeros(B, H, 1, max_len, device=q.device, dtype=torch.float32)
+    for b, seq_len in enumerate(seq_lens.tolist()):
+        if seq_len < max_len:
+            attn_mask[b, :, :, seq_len:] = float("-inf")
+    out = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+    return out.to(dtype=q.dtype)
+
+
+def build_non_contiguous_paged_cache(k, v, seq_lens, physical_block_order):
+    B, H_KV, _, D = k.shape
+    max_num_blocks = max((seq_len + PAGE_BLOCK_SIZE - 1) // PAGE_BLOCK_SIZE for seq_len in seq_lens.tolist())
+    num_physical_blocks = max(physical_block_order[: B * max_num_blocks]) + 1
+    k_cache = torch.zeros(num_physical_blocks, H_KV, PAGE_BLOCK_SIZE, D, device=k.device, dtype=k.dtype)
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.full((B, max_num_blocks), -1, device=k.device, dtype=torch.int32)
+
+    cursor = 0
+    for b in range(B):
+        seq_len = int(seq_lens[b].item())
+        used_blocks = (seq_len + PAGE_BLOCK_SIZE - 1) // PAGE_BLOCK_SIZE
+        for block_idx in range(used_blocks):
+            physical_block = physical_block_order[cursor]
+            cursor += 1
+            block_table[b, block_idx] = physical_block
+            start = block_idx * PAGE_BLOCK_SIZE
+            end = min(start + PAGE_BLOCK_SIZE, seq_len)
+            valid = end - start
+            k_cache[physical_block, :, :valid].copy_(k[b, :, start:end])
+            v_cache[physical_block, :, :valid].copy_(v[b, :, start:end])
+
+    return k_cache, v_cache, block_table, max_num_blocks
 
 def test_decode_kernel():
     """测试 KV Cache / Decode Kernel"""
@@ -114,7 +155,7 @@ def benchmark_decode_kernel():
         
         start.record()
         for _ in range(iterations):
-            out = flash_attn_v100.forward_decode_fp16(q, k, v, True, cache_len)
+            _ = flash_attn_v100.forward_decode_fp16(q, k, v, True, cache_len)
         end.record()
         
         torch.cuda.synchronize()
@@ -225,7 +266,65 @@ def test_correctness():
         print(f"  All close (atol=1e-2): {all_close}")
 
 
+def test_paged_decode_correctness():
+    """验证 paged decode 的 page boundary / mixed seq len / 非连续 block table / cache reuse"""
+    print("\n" + "=" * 80)
+    print("Testing Paged Decode Correctness")
+    print("=" * 80)
+
+    torch.manual_seed(2025)
+    B, H_Q, H_KV, D = 3, 8, 4, 64
+    seq_lens = torch.tensor([16, 23, 33], device="cuda", dtype=torch.int32)
+    max_len = int(seq_lens.max().item())
+
+    q = torch.randn(B, H_Q, 1, D, device="cuda", dtype=torch.float16).contiguous()
+    k = torch.randn(B, H_KV, max_len, D, device="cuda", dtype=torch.float16).contiguous()
+    v = torch.randn(B, H_KV, max_len, D, device="cuda", dtype=torch.float16).contiguous()
+
+    k_expanded = k.repeat_interleave(H_Q // H_KV, dim=1)
+    v_expanded = v.repeat_interleave(H_Q // H_KV, dim=1)
+    out_ref = sdpa_decode_reference(q, k_expanded, v_expanded, seq_lens)
+
+    physical_block_order = [5, 2, 7, 1, 9, 3]
+    k_cache, v_cache, block_table, max_num_blocks = build_non_contiguous_paged_cache(k, v, seq_lens, physical_block_order)
+    out_paged = flash_attn_v100.forward_paged_decode_gqa_fp16(q, k_cache, v_cache, block_table, seq_lens, max_num_blocks)
+    diff = (out_paged.float() - out_ref.float()).abs().max().item()
+
+    print(f"  seq_lens={seq_lens.tolist()}")
+    print(f"  block_table={block_table.tolist()}")
+    print(f"  max_num_blocks={max_num_blocks}")
+    print(f"  Max diff vs SDPA reference: {diff:.8f}")
+    assert diff < 2e-2, f"paged decode diff too large: {diff}"
+
+    # cache reuse: 修改单个 block 的内容后，输出应变化且仍与新的 reference 对齐
+    k_updated = k.clone()
+    v_updated = v.clone()
+    k_updated[1, :, 16:23] += 0.5
+    v_updated[1, :, 16:23] -= 0.25
+    out_ref_updated = sdpa_decode_reference(
+        q,
+        k_updated.repeat_interleave(H_Q // H_KV, dim=1),
+        v_updated.repeat_interleave(H_Q // H_KV, dim=1),
+        seq_lens,
+    )
+    k_cache_updated, v_cache_updated, _, _ = build_non_contiguous_paged_cache(
+        k_updated, v_updated, seq_lens, physical_block_order
+    )
+    out_paged_updated = flash_attn_v100.forward_paged_decode_gqa_fp16(
+        q, k_cache_updated, v_cache_updated, block_table, seq_lens, max_num_blocks
+    )
+    updated_diff = (out_paged_updated.float() - out_ref_updated.float()).abs().max().item()
+    delta = (out_paged_updated.float() - out_paged.float()).abs().max().item()
+
+    print(f"  Max diff after cache reuse update: {updated_diff:.8f}")
+    print(f"  Output delta after block update: {delta:.8f}")
+    assert updated_diff < 2e-2, f"paged decode cache reuse diff too large: {updated_diff}"
+    assert delta > 1e-4, "paged decode output should change after cache update"
+    print("  Result: PASS")
+
+
 if __name__ == '__main__':
     test_decode_kernel()
     benchmark_decode_kernel()
     test_correctness()
+    test_paged_decode_correctness()

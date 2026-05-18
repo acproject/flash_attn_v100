@@ -7,6 +7,8 @@ import torch
 import flash_attn_v100
 import time
 
+from tensor_parallel import TPDecodeRunner, TensorParallelConfig
+
 
 def simple_decode_example():
     """简单的 decode 示例"""
@@ -169,12 +171,51 @@ def compare_causal_vs_noncausal():
     print(f"Outputs are {'same' if diff < 1e-5 else 'different'}")
 
 
+def tensor_parallel_decode_example():
+    """2-GPU Tensor Parallel decode 示例"""
+    if torch.cuda.device_count() < 2:
+        print("\n" + "=" * 80)
+        print("Tensor Parallel Decode Example")
+        print("=" * 80)
+        print("Skip: need at least 2 GPUs")
+        return
+
+    print("\n" + "=" * 80)
+    print("Tensor Parallel Decode Example")
+    print("=" * 80)
+
+    B, H_Q, H_KV, D = 2, 16, 4, 64
+    cache_len = 255
+    total_len = cache_len + 1
+
+    config = TensorParallelConfig(H_Q=H_Q, H_KV=H_KV, D=D, world_size=2, causal=True)
+    runner = TPDecodeRunner(config)
+
+    q = torch.randn(B, H_Q, 1, D, device="cuda:0", dtype=torch.float16).contiguous()
+    k = torch.randn(B, H_KV, total_len, D, device="cuda:0", dtype=torch.float16).contiguous()
+    v = torch.randn(B, H_KV, total_len, D, device="cuda:0", dtype=torch.float16).contiguous()
+
+    out_single = flash_attn_v100.forward_decode_gqa_fp16(q, k, v, True, cache_len)
+    out_tp = runner.decode(q, k, v, cache_len=cache_len, use_workspace=True)
+    diff = (out_single.float() - out_tp.float()).abs().max().item()
+
+    print(f"Input shapes:")
+    print(f"  Q: {q.shape}")
+    print(f"  K: {k.shape}")
+    print(f"  V: {v.shape}")
+    print(f"  TP output shape: {out_tp.shape}")
+    print(f"  Max diff vs single GPU GQA decode: {diff:.8f}")
+    print(f"  Workspace dtype: {runner.workspace.dtype}")
+    print("✓ Tensor Parallel decode success!")
+
+
 if __name__ == '__main__':
     # 运行所有示例
     simple_decode_example()
     autoregressive_simulation()
     batch_decode_example()
     compare_causal_vs_noncausal()
+    tensor_parallel_decode_example()
     
     print("\n" + "=" * 80)
     print("All examples completed successfully!")

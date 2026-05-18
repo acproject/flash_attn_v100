@@ -38,6 +38,49 @@ constexpr int WARPS_PER_BLOCK = 8;
 constexpr int QUERIES_PER_BLOCK = WARPS_PER_BLOCK;
 constexpr int WARP_BLOCK_SIZE = WARPS_PER_BLOCK * WARP_SIZE;
 
+__global__ void flash_attn_kernel_decode_gqa_fp16(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H_Q,
+    int H_KV,
+    int N,
+    int D,
+    bool causal,
+    float scale,
+    int cache_len);
+
+__global__ void flash_attn_kernel_prefill_gqa_fp16(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H_Q,
+    int H_KV,
+    int N,
+    int D,
+    bool causal,
+    float scale);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step_out(
+    torch::Tensor out,
+    torch::Tensor q_compute,
+    torch::Tensor k_compute,
+    torch::Tensor v_compute,
+    torch::Tensor q_transfer,
+    torch::Tensor k_transfer,
+    torch::Tensor v_transfer,
+    torch::Tensor q_h2d_dst,
+    torch::Tensor k_h2d_dst,
+    torch::Tensor v_h2d_dst,
+    bool causal,
+    int cache_len,
+    int64_t compute_stream_int,
+    int64_t transfer_stream_int);
+
 inline void check_same_shape(
     const torch::Tensor& a,
     const torch::Tensor& b,
@@ -140,6 +183,112 @@ inline void check_varlen_prefill_input_shapes(
 inline void check_cache_len(int cache_len, int64_t seq_len) {
     TORCH_CHECK(cache_len >= 0, "cache_len must be non-negative");
     TORCH_CHECK(cache_len < seq_len, "cache_len must be less than sequence length");
+}
+
+inline void check_decode_gqa_output_tensor(
+    const torch::Tensor& out,
+    const torch::Tensor& q
+) {
+    CHECK_INPUT(out);
+    CHECK_DIM(out, 4);
+    CHECK_SAME_DEVICE(out, q);
+    CHECK_SAME_DTYPE(out, q);
+    TORCH_CHECK(out.size(0) == q.size(0), "out batch size must match q");
+    TORCH_CHECK(out.size(1) == q.size(1), "out head count must match q");
+    TORCH_CHECK(out.size(2) == 1, "out sequence length must be 1 for decode mode");
+    TORCH_CHECK(out.size(3) == q.size(3), "out head dimension must match q");
+}
+
+inline void check_prefill_gqa_output_tensor(
+    const torch::Tensor& out,
+    const torch::Tensor& q
+) {
+    CHECK_INPUT(out);
+    CHECK_DIM(out, 4);
+    CHECK_SAME_DEVICE(out, q);
+    CHECK_SAME_DTYPE(out, q);
+    TORCH_CHECK(out.sizes() == q.sizes(), "out shape must match q shape for prefill mode");
+}
+
+inline void launch_decode_gqa_fp16_on_stream(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    torch::Tensor& out,
+    bool causal,
+    int cache_len,
+    cudaStream_t stream = nullptr
+) {
+    auto B = q.size(0);
+    auto H_Q = q.size(1);
+    auto H_KV = k.size(1);
+    auto N = k.size(2);
+    auto D = q.size(3);
+
+    int threads = 128;
+    dim3 grid(B * H_Q);
+    dim3 block(threads);
+    float scale = 1.0f / std::sqrt((float)D);
+
+    flash_attn_kernel_decode_gqa_fp16<<<grid, block, 0, stream>>>(
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        B,
+        H_Q,
+        H_KV,
+        N,
+        D,
+        causal,
+        scale,
+        cache_len
+    );
+    CUDA_KERNEL_CHECK();
+}
+
+inline void launch_decode_gqa_fp16(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    torch::Tensor& out,
+    bool causal,
+    int cache_len
+) {
+    launch_decode_gqa_fp16_on_stream(q, k, v, out, causal, cache_len, nullptr);
+}
+
+inline void launch_prefill_gqa_fp16(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    torch::Tensor& out,
+    bool causal
+) {
+    auto B = q.size(0);
+    auto H_Q = q.size(1);
+    auto H_KV = k.size(1);
+    auto N = q.size(2);
+    auto D = q.size(3);
+
+    dim3 grid((N + TILE_Q - 1) / TILE_Q, B * H_Q);
+    dim3 block(TILE_Q);
+    float scale = 1.0f / std::sqrt((float)D);
+
+    flash_attn_kernel_prefill_gqa_fp16<<<grid, block>>>(
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        B,
+        H_Q,
+        H_KV,
+        N,
+        D,
+        causal,
+        scale
+    );
+    CUDA_KERNEL_CHECK();
 }
 
 // process a block (batch, head, q_tile)
@@ -1302,31 +1451,36 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16(
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
-
-    // 每个 block 处理一个 (batch, q_head)
-    // 使用 128 或 256 个线程（根据 D 的大小调整）
-    int threads = 128;
-    dim3 grid(B * H_Q);
-    dim3 block(threads);
-
-    float scale = 1.0f / std::sqrt((float)D);
-
-    flash_attn_kernel_decode_gqa_fp16<<<grid, block>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H_Q,
-        H_KV,
-        N,
-        D,
-        causal,
-        scale,
-        cache_len
-    );
-    CUDA_KERNEL_CHECK();
+    launch_decode_gqa_fp16(q, k, v, out, causal, cache_len);
     
+    return out;
+}
+
+torch::Tensor flash_attn_forward_decode_gqa_fp16_out(
+    torch::Tensor out,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    int cache_len
+) {
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+    check_decode_gqa_input_shapes(q, k, v);
+    check_decode_gqa_output_tensor(out, q);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
+    TORCH_CHECK(q.size(2) == 1, "q sequence length must be 1 for decode mode");
+
+    auto H_Q = q.size(1);
+    auto H_KV = k.size(1);
+    TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
+    TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
+    TORCH_CHECK(q.size(3) <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    check_cache_len(cache_len, k.size(2));
+    
+    c10::cuda::CUDAGuard device_guard(q.device());
+    launch_decode_gqa_fp16(q, k, v, out, causal, cache_len);
     return out;
 }
 
@@ -1925,27 +2079,33 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16(
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, N, D}, q.options());
+    launch_prefill_gqa_fp16(q, k, v, out, causal);
 
-    dim3 grid((N + TILE_Q - 1) / TILE_Q, B * H_Q);
-    dim3 block(TILE_Q);
+    return out;
+}
 
-    float scale = 1.0f / std::sqrt((float)D);
+torch::Tensor flash_attn_forward_prefill_gqa_fp16_out(
+    torch::Tensor out,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal
+) {
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+    check_prefill_gqa_input_shapes(q, k, v);
+    check_prefill_gqa_output_tensor(out, q);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
 
-    flash_attn_kernel_prefill_gqa_fp16<<<grid, block>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H_Q,
-        H_KV,
-        N,
-        D,
-        causal,
-        scale
-    );
-    CUDA_KERNEL_CHECK();
+    auto H_Q = q.size(1);
+    auto H_KV = k.size(1);
+    TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
+    TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
+    TORCH_CHECK(q.size(3) <= MAX_D, "D must be <= MAX_D(128)");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
+    launch_prefill_gqa_fp16(q, k, v, out, causal);
     return out;
 }
 
@@ -2643,21 +2803,7 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16_stream(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_int);
 
-    flash_attn_kernel_decode_gqa_fp16<<<grid, block, 0, stream>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H_Q,
-        H_KV,
-        N,
-        D,
-        causal,
-        scale,
-        cache_len
-    );
-    CUDA_KERNEL_CHECK();
+    launch_decode_gqa_fp16_on_stream(q, k, v, out, causal, cache_len, stream);
 
     return out;
 }
@@ -2772,20 +2918,51 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step(
     int64_t compute_stream_int,
     int64_t transfer_stream_int
 ) {
+    auto out = torch::zeros({q_compute.size(0), q_compute.size(1), 1, q_compute.size(3)}, q_compute.options());
+    return pipeline_decode_step_out(
+        out,
+        q_compute,
+        k_compute,
+        v_compute,
+        q_transfer,
+        k_transfer,
+        v_transfer,
+        q_h2d_dst,
+        k_h2d_dst,
+        v_h2d_dst,
+        causal,
+        cache_len,
+        compute_stream_int,
+        transfer_stream_int
+    );
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step_out(
+    torch::Tensor out,
+    torch::Tensor q_compute,
+    torch::Tensor k_compute,
+    torch::Tensor v_compute,
+    torch::Tensor q_transfer,
+    torch::Tensor k_transfer,
+    torch::Tensor v_transfer,
+    torch::Tensor q_h2d_dst,
+    torch::Tensor k_h2d_dst,
+    torch::Tensor v_h2d_dst,
+    bool causal,
+    int cache_len,
+    int64_t compute_stream_int,
+    int64_t transfer_stream_int
+) {
     CHECK_INPUT(q_compute);
     CHECK_INPUT(k_compute);
     CHECK_INPUT(v_compute);
     check_decode_gqa_input_shapes(q_compute, k_compute, v_compute);
     TORCH_CHECK(q_compute.dtype() == torch::kHalf, "q_compute, k_compute, v_compute must be float16");
     TORCH_CHECK(q_compute.size(2) == 1, "q_compute sequence length must be 1 for decode mode");
+    check_decode_gqa_output_tensor(out, q_compute);
 
-    auto H_Q = q_compute.size(1);
-    auto H_KV = k_compute.size(1);
-    auto B = q_compute.size(0);
     auto N = k_compute.size(2);
-    auto D = q_compute.size(3);
-
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(q_compute.size(3) <= MAX_D, "D must be <= MAX_D(128)");
     check_cache_len(cache_len, N);
     TORCH_CHECK(!q_transfer.is_cuda() && !k_transfer.is_cuda() && !v_transfer.is_cuda(),
                 "transfer source tensors must be CPU tensors");
@@ -2804,31 +2981,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step(
                 v_h2d_dst.device() == q_compute.device(), "transfer destinations must be on compute device");
 
     c10::cuda::CUDAGuard device_guard(q_compute.device());
-    auto out = torch::zeros({B, H_Q, 1, D}, q_compute.options());
 
     cudaStream_t compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_int);
     cudaStream_t transfer_stream = reinterpret_cast<cudaStream_t>(transfer_stream_int);
-
-    int threads = 128;
-    dim3 grid(B * H_Q);
-    dim3 block(threads);
-    float scale = 1.0f / std::sqrt((float)D);
-
-    flash_attn_kernel_decode_gqa_fp16<<<grid, block, 0, compute_stream>>>(
-        reinterpret_cast<half*>(q_compute.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k_compute.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v_compute.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H_Q,
-        H_KV,
-        N,
-        D,
-        causal,
-        scale,
-        cache_len
-    );
-    CUDA_KERNEL_CHECK();
+    launch_decode_gqa_fp16_on_stream(q_compute, k_compute, v_compute, out, causal, cache_len, compute_stream);
 
     if (q_transfer.numel() > 0 && q_h2d_dst.numel() > 0) {
         size_t q_bytes = q_h2d_dst.numel() * q_h2d_dst.element_size();

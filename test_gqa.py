@@ -6,6 +6,37 @@ import torch
 import flash_attn_v100
 import time
 from tabulate import tabulate
+import torch.nn.functional as F
+
+
+def expand_kv_heads(k, v, num_q_heads):
+    heads_per_kv = num_q_heads // k.size(1)
+    return k.repeat_interleave(heads_per_kv, dim=1), v.repeat_interleave(heads_per_kv, dim=1)
+
+
+def sdpa_reference_gqa(q, k, v, causal=True, seq_lens=None):
+    k_expanded, v_expanded = expand_kv_heads(k, v, q.size(1))
+    q_ref = q.float()
+    k_ref = k_expanded.float()
+    v_ref = v_expanded.float()
+
+    attn_mask = None
+    if seq_lens is not None:
+        max_len = k_ref.size(-2)
+        attn_mask = torch.zeros(q_ref.size(0), q_ref.size(1), q_ref.size(2), max_len, device=q.device, dtype=torch.float32)
+        for b, seq_len in enumerate(seq_lens.tolist()):
+            if seq_len < max_len:
+                attn_mask[b, :, :, seq_len:] = float("-inf")
+
+    out = F.scaled_dot_product_attention(
+        q_ref,
+        k_ref,
+        v_ref,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=causal and q.size(2) > 1,
+    )
+    return out.to(dtype=q.dtype)
 
 
 def test_gqa_correctness():
@@ -84,6 +115,56 @@ def test_gqa_correctness():
             print(f"  ✗ Failed: {str(e)}")
             import traceback
             traceback.print_exc()
+
+
+def test_gqa_against_sdpa():
+    """与 PyTorch SDPA 对比 GQA decode/prefill 数值正确性"""
+    print("\n" + "=" * 80)
+    print("Testing GQA/MQA Against PyTorch SDPA")
+    print("=" * 80)
+
+    torch.manual_seed(1234)
+    decode_cases = [
+        (1, 8, 4, 65, 64),
+        (2, 16, 4, 127, 64),
+        (1, 32, 8, 257, 128),
+    ]
+    prefill_cases = [
+        (1, 8, 4, 64, 64),
+        (2, 16, 4, 96, 64),
+        (1, 32, 8, 128, 128),
+    ]
+
+    print("\nDecode vs SDPA:")
+    for B, H_Q, H_KV, N, D in decode_cases:
+        q = torch.randn(B, H_Q, 1, D, device="cuda", dtype=torch.float16).contiguous()
+        k = torch.randn(B, H_KV, N, D, device="cuda", dtype=torch.float16).contiguous()
+        v = torch.randn(B, H_KV, N, D, device="cuda", dtype=torch.float16).contiguous()
+        seq_lens = torch.full((B,), N, device="cuda", dtype=torch.int32)
+
+        out_kernel = flash_attn_v100.forward_decode_gqa_fp16(q, k, v, True, N - 1)
+        out_sdpa = sdpa_reference_gqa(q, k, v, causal=False, seq_lens=seq_lens)
+        max_diff = (out_kernel.float() - out_sdpa.float()).abs().max().item()
+        mean_diff = (out_kernel.float() - out_sdpa.float()).abs().mean().item()
+
+        print(f"  B={B}, H_Q={H_Q}, H_KV={H_KV}, N={N}, D={D} | max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        assert max_diff < 1e-2, f"decode vs SDPA diff too large: {max_diff}"
+
+    print("\nPrefill vs SDPA:")
+    for B, H_Q, H_KV, N, D in prefill_cases:
+        q = torch.randn(B, H_Q, N, D, device="cuda", dtype=torch.float16).contiguous()
+        k = torch.randn(B, H_KV, N, D, device="cuda", dtype=torch.float16).contiguous()
+        v = torch.randn(B, H_KV, N, D, device="cuda", dtype=torch.float16).contiguous()
+
+        out_kernel = flash_attn_v100.forward_prefill_gqa_fp16(q, k, v, True)
+        out_sdpa = sdpa_reference_gqa(q, k, v, causal=True)
+        max_diff = (out_kernel.float() - out_sdpa.float()).abs().max().item()
+        mean_diff = (out_kernel.float() - out_sdpa.float()).abs().mean().item()
+
+        print(f"  B={B}, H_Q={H_Q}, H_KV={H_KV}, N={N}, D={D} | max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        assert max_diff < 2e-2, f"prefill vs SDPA diff too large: {max_diff}"
+
+    print("  Result: PASS")
 
 
 def benchmark_gqa_performance():
@@ -297,6 +378,7 @@ def demo_gqa_usage():
 if __name__ == '__main__':
     # 测试正确性
     test_gqa_correctness()
+    test_gqa_against_sdpa()
     
     # 性能 benchmark
     benchmark_gqa_performance()

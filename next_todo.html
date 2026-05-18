@@ -1,0 +1,232 @@
+<h2>后续工作总览（按优先级）</h2>
+<h3>Phase 1：Correctness Validation（必须）</h3>
+<h4>1. 数值正确性验证</h4>
+<p>与以下基线逐 token 对比：</p>
+<ul>
+<li>PyTorch SDPA
+FlashAttention official
+vLLM
+TensorRT-LLM</li>
+</ul>
+
+<p>验证项：</p>
+<ul>
+<li>attention output</li>
+<li>logits</li>
+<li>softmax lse</li>
+<li>KV cache 更新
+
+<p>容差：</p>
+<ul>
+<li>FP16/BF16：1e-2 ~ 1e-3</li>
+<li>FP8：相对误差</li>
+</ul>
+<h4>2. TP correctness</h4>
+<p>验证：</p>
+
+<ul>
+<li>TP=1</li>
+<li>TP=2</li>
+<li>TP=4</li>
+<li>TP=8</li>
+</ul>
+
+<p>检查：</p>
+
+<ul>
+<li>all-reduce / all-gather 结果</li>
+<li>rank slicing</li>
+<li>rotary offsets</li>
+<li>logits 一致性</li>
+<h4>3. Paged cache correctness</h4>
+
+<p>测试：</p>
+
+<ul>
+<li>page boundary</li>
+<li>非连续 block table</li>
+<li>mixed sequence lengths</li>
+<li>cache reuse</li>
+<h3>Phase 2：Benchmark（最重要）</h3>
+<h4>4. Kernel microbenchmark</h4>
+<p>记录：</p>
+
+<ul>
+<li>latency/token</li>
+TFLOPS
+HBM bandwidth
+occupancy
+
+变量：
+<li>TFLOPS</li>
+<li>HBM bandwidth</li>
+<li>occupancy</li>
+
+<p>变量：</p>   
+
+<ul>
+<li>head_dim</li>
+<li>seq_len</li>
+<li>batch_size</li>
+<li>block_size</li>
+<li>GQA ratio</li>
+</ul>
+<h4>5. End-to-end benchmark</h4>
+
+<p>记录：</p>
+
+<ul>
+<li>tok/s</li>
+<li>TTFT</li>
+<li>ITL</li>
+<li>GPU utilization</li>
+<li>NVLink utilization</li>
+</ul>
+
+<p>对比：</p>
+
+<ul>
+<li>vLLM
+SGLang
+TensorRT-LLM
+<h3>Phase 3：Kernel Optimization</h3>
+<h4>6. Reduce register pressure</h4>
+
+<p>记录：</p>
+
+<ul>
+<li>live range 缩短</li>
+<li>shared memory staging</li>
+<li>__launch_bounds__</li>
+</ul>
+<h4>7. Overlap communication</h4>
+
+<p>记录：</p>
+
+<ul>
+<li>compute 与 NCCL overlap</li>
+<li>stream pipelining</li>
+<li>chunked all-reduce</li>
+</ul>
+<h4>8. Specializations</h4>
+
+<p>记录：</p>
+
+<ul>
+<li>head_dim = 64/80/96/128/256</li>
+<li>block_size = 16/32/64</li>
+<li>causal decode only</li>
+</ul>
+<h4>9. Persistent kernel</h4>
+
+<p>记录：</p>
+
+<ul>
+<li>compute 与 NCCL overlap
+stream pipelining</li>
+<li>chunked all-reduce</li>
+</ul>
+
+<p>记录：</p>
+
+<p>针对：</p>
+
+<ul>
+<li>head_dim = 64/80/96/128/256</li>
+<li>block_size = 16/32/64</li>
+<li>causal decode only</li>
+</ul>
+<h4>9. Persistent kernel</h4>
+
+<p>记录：</p>
+
+<P>减少 launch overhead。</P>
+
+<h3>Phase 4：Advanced Features</h3>
+<h4>10. GQA / MQA</h4>
+
+<p>支持：</p>
+
+<ul>
+<li>num_q_heads != num_kv_heads</li>
+<li>11. Sliding Window Attention</h4>
+
+<p>记录：</p>
+
+<p>适配：</p>
+<ul>
+<li>Mistral AI</li>
+<li>Google Gemma</li>
+</ul>
+<h4>12. Prefix Caching</h4>
+
+<P>共享 prompt cache。</P>
+
+<h4>13. Chunked Prefill</h4>
+
+<P>实现 prefill + decode 统一。</P>
+
+<P>实现 prefill + decode 统一。</P> 
+
+<h4>14. Speculative Decoding</h4>
+<P>实现 speculative decoding。</P>  
+<ul>
+<li>draft model</li>
+<li>verify attention</li>
+</ul>
+<P>实现verify attention</P>
+
+<h3>Phase 5：Production Engineering</h3>
+<h4>15. Dispatcher</h4>
+
+<P>根据 shape 选择最佳 kernel。</P>
+
+<h4>16. CUDA Graph</h4>
+
+<P>减少 launch overhead。</P>   
+
+<h4>17. Autotuner</h4>
+
+<P>自动选择：</P>
+
+<p>变量：</p>
+
+<ul>
+<li>tile size</li>
+<li>num warps</li>
+<li>stages</li>
+</ul>
+
+<h4>18. Unit Tests</h4>
+
+<P>覆盖：</P>
+
+<ul>
+<li>edge cases</li>
+<li>stress tests</li>
+<li>random tests</li>
+</ul>
+
+<h4>19. CI</h4>
+
+<P>多 GPU 自动测试。</P>
+
+<h4>20. Profiling Pipeline</h4>
+
+<P>集成：</P>
+<ul>
+<li>Nsight Compute</li>
+<li>NVIDIA Nsight Systems</li>
+</ul>
+
+<h3>Phase 6：模型支持</h3>
+
+<p>记录：</p>
+
+<p>适配：</p>   
+<ul>
+<li>Meta Platforms Llama 2/3</li>
+<li>Alibaba Group Qwen</li>
+<li>Mistral AI Mistral</li>
+<li>Google Gemma</li>
+<li>DeepSeek DeepSeek</li>

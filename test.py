@@ -101,6 +101,43 @@ def main():
             print("cross-device check = PASS")
             print("message =", str(exc).splitlines()[0])
 
+    print("\n" + "=" * 50)
+    print("Output Reuse Checks")
+    print("=" * 50)
+
+    B_gqa, H_Q, H_KV, N_gqa, D_gqa = 2, 16, 4, 128, 64
+    q_decode = torch.randn(B_gqa, H_Q, 1, D_gqa, device='cuda', dtype=torch.float16).contiguous()
+    k_gqa = torch.randn(B_gqa, H_KV, N_gqa, D_gqa, device='cuda', dtype=torch.float16).contiguous()
+    v_gqa = torch.randn(B_gqa, H_KV, N_gqa, D_gqa, device='cuda', dtype=torch.float16).contiguous()
+
+    decode_ref = flash_attn_v100.forward_decode_gqa_fp16(q_decode, k_gqa, v_gqa, True, N_gqa - 1)
+    decode_out = torch.full_like(decode_ref, 123.0)
+    decode_out_ptr = decode_out.data_ptr()
+    decode_result = flash_attn_v100.forward_decode_gqa_fp16_out(decode_out, q_decode, k_gqa, v_gqa, True, N_gqa - 1)
+    decode_diff = (decode_result - decode_ref).abs().max().item()
+    print('decode out max diff =', decode_diff)
+    print('decode out reused buffer =', decode_result.data_ptr() == decode_out_ptr)
+
+    q_prefill = torch.randn(B_gqa, H_Q, N_gqa, D_gqa, device='cuda', dtype=torch.float16).contiguous()
+    k_prefill = torch.randn(B_gqa, H_KV, N_gqa, D_gqa, device='cuda', dtype=torch.float16).contiguous()
+    v_prefill = torch.randn(B_gqa, H_KV, N_gqa, D_gqa, device='cuda', dtype=torch.float16).contiguous()
+
+    prefill_ref = flash_attn_v100.forward_prefill_gqa_fp16(q_prefill, k_prefill, v_prefill, True)
+    prefill_out = torch.full_like(prefill_ref, -7.0)
+    prefill_out_ptr = prefill_out.data_ptr()
+    prefill_result = flash_attn_v100.forward_prefill_gqa_fp16_out(prefill_out, q_prefill, k_prefill, v_prefill, True)
+    prefill_diff = (prefill_result - prefill_ref).abs().max().item()
+    print('prefill out max diff =', prefill_diff)
+    print('prefill out reused buffer =', prefill_result.data_ptr() == prefill_out_ptr)
+
+    try:
+        bad_out = torch.empty(B_gqa, H_Q, 2, D_gqa, device='cuda', dtype=torch.float16)
+        flash_attn_v100.forward_decode_gqa_fp16_out(bad_out, q_decode, k_gqa, v_gqa, True, N_gqa - 1)
+        print("bad out shape check = FAILED")
+    except RuntimeError as exc:
+        print("bad out shape check = PASS")
+        print("message =", str(exc).splitlines()[0])
+
 
 if __name__ == '__main__':
     main()
