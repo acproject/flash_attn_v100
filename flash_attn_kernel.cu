@@ -1088,7 +1088,7 @@ torch::Tensor flash_attn_forward_fp16_warp(
     auto N = q.size(2);
     auto D = q.size(3);
 
-    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(64)");
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
@@ -1562,7 +1562,7 @@ torch::Tensor flash_attn_forward_fp16(
     auto N = q.size(2);
     auto D = q.size(3);
 
-    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(64)");
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
@@ -1651,7 +1651,7 @@ std::tuple<torch::Tensor, torch::Tensor> flash_attn_forward_fp16_with_lse(
     auto N = q.size(2);
     auto D = q.size(3);
 
-    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(64)");
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
 
     auto out = torch::zeros_like(q);
     auto lse = torch::empty({B, H, N}, q.options().dtype(torch::kFloat32));
