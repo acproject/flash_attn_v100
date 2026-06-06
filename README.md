@@ -217,7 +217,9 @@ import flash_attn_v100
 # Prefill 阶段
 flash_attn_v100.forward(q, k, v, causal)              # FP32
 flash_attn_v100.forward_fp16(q, k, v, causal)         # FP16
-flash_attn_v100.backward(dout, q, k, v, causal)       # FP32/FP16 MHA backward
+flash_attn_v100.forward_with_lse(q, k, v, causal)     # FP32, returns (out, logsumexp)
+flash_attn_v100.forward_fp16_with_lse(q, k, v, causal) # FP16, returns (out, logsumexp)
+flash_attn_v100.backward(dout, q, k, v, out, logsumexp, causal) # FP32/FP16 MHA tiled backward
 flash_attn_v100.forward_fp16_warp(q, k, v, causal)    # FP16 + Warp 优化
 flash_attn_v100.forward_fp16_wmma(q, k, v, causal)    # FP16 + WMMA
 
@@ -288,7 +290,7 @@ loss = out.float().pow(2).mean()
 loss.backward()
 ```
 
-当前 backward 支持标准 MHA 的 `[B, H, N, D]` FP32/FP16 输入，对应 `forward` 和 `forward_fp16`。Decode KV cache、GQA/MQA prefill 和 varlen prefill 的反向传播还没有接入。
+当前 backward 支持标准 MHA 的 `[B, H, N, D]` FP32/FP16 输入，对应 `forward_with_lse` 和 `forward_fp16_with_lse`。Decode KV cache、GQA/MQA prefill 和 varlen prefill 的反向传播还没有接入。
 
 ### 参数说明
 

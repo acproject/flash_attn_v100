@@ -1,4 +1,5 @@
 import torch
+import flash_attn_v100
 
 from flash_attn_autograd import flash_attn
 
@@ -14,6 +15,18 @@ def reference(q, k, v, causal=True):
 
     probs = torch.softmax(scores, dim=-1)
     return torch.matmul(probs, v)
+
+
+def reference_lse(q, k, causal=True):
+    d = q.size(-1)
+    scores = torch.matmul(q, k.transpose(-1, -2)) / (d ** 0.5)
+
+    if causal:
+        n = q.size(-2)
+        mask = torch.triu(torch.ones(n, n, device=q.device), diagonal=1)
+        scores = scores.masked_fill(mask.bool(), float("-inf"))
+
+    return torch.logsumexp(scores.float(), dim=-1)
 
 
 def clone_with_grad(x):
@@ -55,7 +68,35 @@ def compare_backward(dtype, causal):
         assert ok
 
 
+def compare_forward_with_lse(dtype, causal):
+    torch.manual_seed(11)
+    B, H, N, D = 2, 3, 17, 32
+    q = torch.randn(B, H, N, D, device="cuda", dtype=dtype).contiguous()
+    k = torch.randn(B, H, N, D, device="cuda", dtype=dtype).contiguous()
+    v = torch.randn(B, H, N, D, device="cuda", dtype=dtype).contiguous()
+
+    if dtype == torch.float16:
+        out, lse = flash_attn_v100.forward_fp16_with_lse(q, k, v, causal)
+    else:
+        out, lse = flash_attn_v100.forward_with_lse(q, k, v, causal)
+
+    out_ref = reference(q, k, v, causal)
+    lse_ref = reference_lse(q, k, causal)
+    out_atol = 2e-4 if dtype == torch.float32 else 3e-2
+    lse_atol = 2e-4 if dtype == torch.float32 else 3e-2
+
+    out_ok = torch.allclose(out.float(), out_ref.float(), atol=out_atol, rtol=out_atol)
+    lse_ok = torch.allclose(lse, lse_ref, atol=lse_atol, rtol=lse_atol)
+    print(f"{dtype} causal={causal} out allclose={out_ok} lse allclose={lse_ok}")
+    assert out_ok
+    assert lse_ok
+
+
 def main():
+    compare_forward_with_lse(torch.float32, causal=True)
+    compare_forward_with_lse(torch.float32, causal=False)
+    compare_forward_with_lse(torch.float16, causal=True)
+    compare_forward_with_lse(torch.float16, causal=False)
     compare_backward(torch.float32, causal=True)
     compare_backward(torch.float32, causal=False)
     compare_backward(torch.float16, causal=True)
@@ -64,4 +105,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

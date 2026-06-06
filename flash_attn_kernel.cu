@@ -297,6 +297,7 @@ __global__ void flash_attn_kernel(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
+    float* __restrict__ LSE,
     int B,
     int H,
     int N,
@@ -420,8 +421,12 @@ __global__ void flash_attn_kernel(
 
     // reback write
     if (is_active) {
+    int q_idx_write = q_start + tid;
     for (int d = 0; d < D; ++d) {
-        O_ptr[(q_start + tid) * D + d] = acc[d] / l_i;
+        O_ptr[q_idx_write * D + d] = acc[d] / l_i;
+    }
+    if (LSE != nullptr) {
+        LSE[bh * N + q_idx_write] = m_i + logf(l_i);
     }
     }
 }
@@ -458,6 +463,7 @@ torch::Tensor flash_attn_forward(
         k.data_ptr<float>(),
         v.data_ptr<float>(),
         out.data_ptr<float>(),
+        nullptr,
         B,
         H,
         N,
@@ -768,6 +774,7 @@ __global__ void flash_attn_kernel_fp16(
     const half* __restrict__ K,
     const half* __restrict__ V,
     half* __restrict__ O,
+    float* __restrict__ LSE,
     int B,
     int H,
     int N,
@@ -918,6 +925,9 @@ __global__ void flash_attn_kernel_fp16(
             __float2half(acc[d+1] / l_i)
         );
         *reinterpret_cast<half2*>(&O_ptr[q_idx_write * D + d]) = out_h2;
+    }
+    if (LSE != nullptr) {
+        LSE[bh * N + q_idx_write] = m_i + logf(l_i);
     }
     }
 }
@@ -1093,6 +1103,7 @@ torch::Tensor flash_attn_forward_fp16_warp(
         reinterpret_cast<half*>(k.data_ptr<at::Half>()),
         reinterpret_cast<half*>(v.data_ptr<at::Half>()),
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        nullptr,
         B,
         H,
         N,
@@ -1522,6 +1533,7 @@ torch::Tensor flash_attn_forward_decode_fp16(
         reinterpret_cast<half*>(k.data_ptr<at::Half>()),
         reinterpret_cast<half*>(v.data_ptr<at::Half>()),
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        nullptr,
         B,
         H,
         N,
@@ -1567,6 +1579,7 @@ torch::Tensor flash_attn_forward_fp16(
         reinterpret_cast<half*>(k.data_ptr<at::Half>()),
         reinterpret_cast<half*>(v.data_ptr<at::Half>()),
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        nullptr,
         B,
         H,
         N,
@@ -1579,11 +1592,105 @@ torch::Tensor flash_attn_forward_fp16(
     return out;
 }
 
-__global__ void flash_attn_backward_kernel_fp32(
+std::tuple<torch::Tensor, torch::Tensor> flash_attn_forward_with_lse(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal
+) {
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+    check_mha_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kFloat32, "q, k, v must be float32");
+
+    auto B = q.size(0);
+    auto H = q.size(1);
+    auto N = q.size(2);
+    auto D = q.size(3);
+
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+
+    auto out = torch::zeros_like(q);
+    auto lse = torch::empty({B, H, N}, q.options().dtype(torch::kFloat32));
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    dim3 qrid((N + TILE_Q - 1) / TILE_Q, B * H);
+    dim3 block(TILE_Q);
+    float scale = 1.0f / std::sqrt((float)D);
+
+    flash_attn_kernel<<<qrid, block>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        out.data_ptr<float>(),
+        lse.data_ptr<float>(),
+        B,
+        H,
+        N,
+        D,
+        causal,
+        scale
+    );
+    CUDA_KERNEL_CHECK();
+    return std::make_tuple(out, lse);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> flash_attn_forward_fp16_with_lse(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal
+) {
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+    check_mha_input_shapes(q, k, v);
+    TORCH_CHECK(q.dtype() == torch::kHalf, "q, k, v must be float16");
+
+    auto B = q.size(0);
+    auto H = q.size(1);
+    auto N = q.size(2);
+    auto D = q.size(3);
+
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(64)");
+
+    auto out = torch::zeros_like(q);
+    auto lse = torch::empty({B, H, N}, q.options().dtype(torch::kFloat32));
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    dim3 qrid((N + TILE_Q - 1) / TILE_Q, B * H);
+    dim3 block(TILE_Q);
+    float scale = 1.0f / std::sqrt((float)D);
+
+    flash_attn_kernel_fp16<<<qrid, block>>>(
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        lse.data_ptr<float>(),
+        B,
+        H,
+        N,
+        D,
+        causal,
+        scale
+    );
+    CUDA_KERNEL_CHECK();
+    return std::make_tuple(out, lse);
+}
+
+constexpr int BWD_TILE_Q = 16;
+constexpr int BWD_TILE_K = 16;
+constexpr int BWD_THREADS = BWD_TILE_Q * BWD_TILE_K;
+
+__global__ void flash_attn_backward_tiled_kernel_fp32(
     const float* __restrict__ dO,
     const float* __restrict__ Q,
     const float* __restrict__ K,
     const float* __restrict__ V,
+    const float* __restrict__ O,
+    const float* __restrict__ LSE,
     float* __restrict__ dQ,
     float* __restrict__ dK,
     float* __restrict__ dV,
@@ -1594,96 +1701,56 @@ __global__ void flash_attn_backward_kernel_fp32(
     bool causal,
     float scale
 ) {
-    int row = blockIdx.x;
-    int q_idx = row % N;
-    int bh = row / N;
+    int q_start = blockIdx.x * BWD_TILE_Q;
+    int k_start = blockIdx.y * BWD_TILE_K;
+    int bh = blockIdx.z;
+    int tid = threadIdx.x;
+    int qi = tid / BWD_TILE_K;
+    int kj = tid % BWD_TILE_K;
+    int q_idx = q_start + qi;
+    int k_idx = k_start + kj;
+
+    if (q_idx >= N || k_idx >= N || (causal && k_idx > q_idx)) return;
+
     int base = bh * N * D;
-
     const float* q_row = Q + base + q_idx * D;
+    const float* k_row = K + base + k_idx * D;
+    const float* v_row = V + base + k_idx * D;
     const float* do_row = dO + base + q_idx * D;
+    const float* o_row = O + base + q_idx * D;
     float* dq_row = dQ + base + q_idx * D;
+    float* dk_row = dK + base + k_idx * D;
+    float* dv_row = dV + base + k_idx * D;
 
-    float m = -FLT_MAX;
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const float* k_row = K + base + j * D;
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += q_row[d] * k_row[d];
-        }
-        m = fmaxf(m, score * scale);
-    }
-
-    float l = 0.0f;
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const float* k_row = K + base + j * D;
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += q_row[d] * k_row[d];
-        }
-        l += expf(score * scale - m);
-    }
-
+    float score = 0.0f;
+    float do_dot_v = 0.0f;
     float delta = 0.0f;
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const float* k_row = K + base + j * D;
-        const float* v_row = V + base + j * D;
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += q_row[d] * k_row[d];
-        }
-        float p = expf(score * scale - m) / l;
-        float do_dot_v = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            do_dot_v += do_row[d] * v_row[d];
-        }
-        delta += p * do_dot_v;
+    for (int d = 0; d < D; ++d) {
+        score += q_row[d] * k_row[d];
+        do_dot_v += do_row[d] * v_row[d];
+        delta += do_row[d] * o_row[d];
     }
 
-    float dq_acc[MAX_D];
-    for (int d = 0; d < D; ++d) dq_acc[d] = 0.0f;
-
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const float* k_row = K + base + j * D;
-        const float* v_row = V + base + j * D;
-        float* dk_row = dK + base + j * D;
-        float* dv_row = dV + base + j * D;
-
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += q_row[d] * k_row[d];
-        }
-        float p = expf(score * scale - m) / l;
-
-        float do_dot_v = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            do_dot_v += do_row[d] * v_row[d];
-        }
-        float ds = p * (do_dot_v - delta) * scale;
-
-        for (int d = 0; d < D; ++d) {
-            dq_acc[d] += ds * k_row[d];
-            atomicAdd(dk_row + d, ds * q_row[d]);
-            atomicAdd(dv_row + d, p * do_row[d]);
-        }
-    }
+    float p = expf(score * scale - LSE[bh * N + q_idx]);
+    float ds = p * (do_dot_v - delta) * scale;
 
     for (int d = 0; d < D; ++d) {
-        dq_row[d] = dq_acc[d];
+        atomicAdd(dq_row + d, ds * k_row[d]);
+        atomicAdd(dk_row + d, ds * q_row[d]);
+        atomicAdd(dv_row + d, p * do_row[d]);
     }
 }
 
-__global__ void flash_attn_backward_kernel_fp16(
+__global__ void flash_attn_backward_tiled_kernel_fp16(
     const half* __restrict__ dO,
     const half* __restrict__ Q,
     const half* __restrict__ K,
     const half* __restrict__ V,
-    half* __restrict__ dQ,
-    half* __restrict__ dK,
-    half* __restrict__ dV,
+    const half* __restrict__ O,
+    const float* __restrict__ LSE,
+    float* __restrict__ dQ,
+    float* __restrict__ dK,
+    float* __restrict__ dV,
     int B,
     int H,
     int N,
@@ -1691,85 +1758,46 @@ __global__ void flash_attn_backward_kernel_fp16(
     bool causal,
     float scale
 ) {
-    int row = blockIdx.x;
-    int q_idx = row % N;
-    int bh = row / N;
+    int q_start = blockIdx.x * BWD_TILE_Q;
+    int k_start = blockIdx.y * BWD_TILE_K;
+    int bh = blockIdx.z;
+    int tid = threadIdx.x;
+    int qi = tid / BWD_TILE_K;
+    int kj = tid % BWD_TILE_K;
+    int q_idx = q_start + qi;
+    int k_idx = k_start + kj;
+
+    if (q_idx >= N || k_idx >= N || (causal && k_idx > q_idx)) return;
+
     int base = bh * N * D;
-
     const half* q_row = Q + base + q_idx * D;
+    const half* k_row = K + base + k_idx * D;
+    const half* v_row = V + base + k_idx * D;
     const half* do_row = dO + base + q_idx * D;
-    half* dq_row = dQ + base + q_idx * D;
+    const half* o_row = O + base + q_idx * D;
+    float* dq_row = dQ + base + q_idx * D;
+    float* dk_row = dK + base + k_idx * D;
+    float* dv_row = dV + base + k_idx * D;
 
-    float m = -FLT_MAX;
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const half* k_row = K + base + j * D;
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += __half2float(q_row[d]) * __half2float(k_row[d]);
-        }
-        m = fmaxf(m, score * scale);
-    }
-
-    float l = 0.0f;
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const half* k_row = K + base + j * D;
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += __half2float(q_row[d]) * __half2float(k_row[d]);
-        }
-        l += expf(score * scale - m);
-    }
-
+    float score = 0.0f;
+    float do_dot_v = 0.0f;
     float delta = 0.0f;
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const half* k_row = K + base + j * D;
-        const half* v_row = V + base + j * D;
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += __half2float(q_row[d]) * __half2float(k_row[d]);
-        }
-        float p = expf(score * scale - m) / l;
-        float do_dot_v = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            do_dot_v += __half2float(do_row[d]) * __half2float(v_row[d]);
-        }
-        delta += p * do_dot_v;
+    for (int d = 0; d < D; ++d) {
+        float q_val = __half2float(q_row[d]);
+        float k_val = __half2float(k_row[d]);
+        float do_val = __half2float(do_row[d]);
+        score += q_val * k_val;
+        do_dot_v += do_val * __half2float(v_row[d]);
+        delta += do_val * __half2float(o_row[d]);
     }
 
-    float dq_acc[MAX_D];
-    for (int d = 0; d < D; ++d) dq_acc[d] = 0.0f;
-
-    for (int j = 0; j < N; ++j) {
-        if (causal && j > q_idx) continue;
-        const half* k_row = K + base + j * D;
-        const half* v_row = V + base + j * D;
-        half* dk_row = dK + base + j * D;
-        half* dv_row = dV + base + j * D;
-
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            score += __half2float(q_row[d]) * __half2float(k_row[d]);
-        }
-        float p = expf(score * scale - m) / l;
-
-        float do_dot_v = 0.0f;
-        for (int d = 0; d < D; ++d) {
-            do_dot_v += __half2float(do_row[d]) * __half2float(v_row[d]);
-        }
-        float ds = p * (do_dot_v - delta) * scale;
-
-        for (int d = 0; d < D; ++d) {
-            dq_acc[d] += ds * __half2float(k_row[d]);
-            atomicAdd(dk_row + d, __float2half(ds * __half2float(q_row[d])));
-            atomicAdd(dv_row + d, __float2half(p * __half2float(do_row[d])));
-        }
-    }
+    float p = expf(score * scale - LSE[bh * N + q_idx]);
+    float ds = p * (do_dot_v - delta) * scale;
 
     for (int d = 0; d < D; ++d) {
-        dq_row[d] = __float2half(dq_acc[d]);
+        atomicAdd(dq_row + d, ds * __half2float(k_row[d]));
+        atomicAdd(dk_row + d, ds * __half2float(q_row[d]));
+        atomicAdd(dv_row + d, p * __half2float(do_row[d]));
     }
 }
 
@@ -1778,17 +1806,26 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> flash_attn_backward(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
+    torch::Tensor out,
+    torch::Tensor logsumexp,
     bool causal
 ) {
     CHECK_INPUT(dout);
     CHECK_INPUT(q);
     CHECK_INPUT(k);
     CHECK_INPUT(v);
+    CHECK_INPUT(out);
+    CHECK_INPUT(logsumexp);
     check_mha_input_shapes(q, k, v);
     check_same_shape(dout, q, "dout", "q");
+    check_same_shape(out, q, "out", "q");
     CHECK_SAME_DEVICE(dout, q);
+    CHECK_SAME_DEVICE(out, q);
+    CHECK_SAME_DEVICE(logsumexp, q);
     CHECK_SAME_DTYPE(dout, q);
+    CHECK_SAME_DTYPE(out, q);
     TORCH_CHECK(q.dtype() == torch::kFloat32 || q.dtype() == torch::kHalf, "q, k, v must be float32 or float16");
+    TORCH_CHECK(logsumexp.dtype() == torch::kFloat32, "logsumexp must be float32");
 
     auto B = q.size(0);
     auto H = q.size(1);
@@ -1796,22 +1833,27 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> flash_attn_backward(
     auto D = q.size(3);
 
     TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    CHECK_DIM(logsumexp, 3);
+    TORCH_CHECK(logsumexp.size(0) == B && logsumexp.size(1) == H && logsumexp.size(2) == N,
+                "logsumexp shape must be [B, H, N]");
 
     c10::cuda::CUDAGuard device_guard(q.device());
-    auto dq = torch::zeros_like(q);
-    auto dk = torch::zeros_like(k);
-    auto dv = torch::zeros_like(v);
-
-    dim3 grid(B * H * N);
-    dim3 block(1);
+    dim3 grid((N + BWD_TILE_Q - 1) / BWD_TILE_Q, (N + BWD_TILE_K - 1) / BWD_TILE_K, B * H);
+    dim3 block(BWD_THREADS);
     float scale = 1.0f / std::sqrt((float)D);
 
     if (q.dtype() == torch::kFloat32) {
-        flash_attn_backward_kernel_fp32<<<grid, block>>>(
+        auto dq = torch::zeros_like(q);
+        auto dk = torch::zeros_like(k);
+        auto dv = torch::zeros_like(v);
+
+        flash_attn_backward_tiled_kernel_fp32<<<grid, block>>>(
             dout.data_ptr<float>(),
             q.data_ptr<float>(),
             k.data_ptr<float>(),
             v.data_ptr<float>(),
+            out.data_ptr<float>(),
+            logsumexp.data_ptr<float>(),
             dq.data_ptr<float>(),
             dk.data_ptr<float>(),
             dv.data_ptr<float>(),
@@ -1822,15 +1864,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> flash_attn_backward(
             causal,
             scale
         );
+        CUDA_KERNEL_CHECK();
+        return std::make_tuple(dq, dk, dv);
     } else {
-        flash_attn_backward_kernel_fp16<<<grid, block>>>(
+        auto float_options = q.options().dtype(torch::kFloat32);
+        auto dq = torch::zeros(q.sizes(), float_options);
+        auto dk = torch::zeros(k.sizes(), float_options);
+        auto dv = torch::zeros(v.sizes(), float_options);
+
+        flash_attn_backward_tiled_kernel_fp16<<<grid, block>>>(
             reinterpret_cast<half*>(dout.data_ptr<at::Half>()),
             reinterpret_cast<half*>(q.data_ptr<at::Half>()),
             reinterpret_cast<half*>(k.data_ptr<at::Half>()),
             reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(dq.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(dk.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(dv.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            logsumexp.data_ptr<float>(),
+            dq.data_ptr<float>(),
+            dk.data_ptr<float>(),
+            dv.data_ptr<float>(),
             B,
             H,
             N,
@@ -1838,10 +1889,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> flash_attn_backward(
             causal,
             scale
         );
+        CUDA_KERNEL_CHECK();
+        return std::make_tuple(dq.to(torch::kHalf), dk.to(torch::kHalf), dv.to(torch::kHalf));
     }
-    CUDA_KERNEL_CHECK();
-
-    return std::make_tuple(dq, dk, dv);
 }
 
 constexpr int WMMA_Q = 32;
