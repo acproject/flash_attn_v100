@@ -1579,6 +1579,271 @@ torch::Tensor flash_attn_forward_fp16(
     return out;
 }
 
+__global__ void flash_attn_backward_kernel_fp32(
+    const float* __restrict__ dO,
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ dQ,
+    float* __restrict__ dK,
+    float* __restrict__ dV,
+    int B,
+    int H,
+    int N,
+    int D,
+    bool causal,
+    float scale
+) {
+    int row = blockIdx.x;
+    int q_idx = row % N;
+    int bh = row / N;
+    int base = bh * N * D;
+
+    const float* q_row = Q + base + q_idx * D;
+    const float* do_row = dO + base + q_idx * D;
+    float* dq_row = dQ + base + q_idx * D;
+
+    float m = -FLT_MAX;
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const float* k_row = K + base + j * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += q_row[d] * k_row[d];
+        }
+        m = fmaxf(m, score * scale);
+    }
+
+    float l = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const float* k_row = K + base + j * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += q_row[d] * k_row[d];
+        }
+        l += expf(score * scale - m);
+    }
+
+    float delta = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const float* k_row = K + base + j * D;
+        const float* v_row = V + base + j * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += q_row[d] * k_row[d];
+        }
+        float p = expf(score * scale - m) / l;
+        float do_dot_v = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            do_dot_v += do_row[d] * v_row[d];
+        }
+        delta += p * do_dot_v;
+    }
+
+    float dq_acc[MAX_D];
+    for (int d = 0; d < D; ++d) dq_acc[d] = 0.0f;
+
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const float* k_row = K + base + j * D;
+        const float* v_row = V + base + j * D;
+        float* dk_row = dK + base + j * D;
+        float* dv_row = dV + base + j * D;
+
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += q_row[d] * k_row[d];
+        }
+        float p = expf(score * scale - m) / l;
+
+        float do_dot_v = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            do_dot_v += do_row[d] * v_row[d];
+        }
+        float ds = p * (do_dot_v - delta) * scale;
+
+        for (int d = 0; d < D; ++d) {
+            dq_acc[d] += ds * k_row[d];
+            atomicAdd(dk_row + d, ds * q_row[d]);
+            atomicAdd(dv_row + d, p * do_row[d]);
+        }
+    }
+
+    for (int d = 0; d < D; ++d) {
+        dq_row[d] = dq_acc[d];
+    }
+}
+
+__global__ void flash_attn_backward_kernel_fp16(
+    const half* __restrict__ dO,
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ dQ,
+    half* __restrict__ dK,
+    half* __restrict__ dV,
+    int B,
+    int H,
+    int N,
+    int D,
+    bool causal,
+    float scale
+) {
+    int row = blockIdx.x;
+    int q_idx = row % N;
+    int bh = row / N;
+    int base = bh * N * D;
+
+    const half* q_row = Q + base + q_idx * D;
+    const half* do_row = dO + base + q_idx * D;
+    half* dq_row = dQ + base + q_idx * D;
+
+    float m = -FLT_MAX;
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const half* k_row = K + base + j * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += __half2float(q_row[d]) * __half2float(k_row[d]);
+        }
+        m = fmaxf(m, score * scale);
+    }
+
+    float l = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const half* k_row = K + base + j * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += __half2float(q_row[d]) * __half2float(k_row[d]);
+        }
+        l += expf(score * scale - m);
+    }
+
+    float delta = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const half* k_row = K + base + j * D;
+        const half* v_row = V + base + j * D;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += __half2float(q_row[d]) * __half2float(k_row[d]);
+        }
+        float p = expf(score * scale - m) / l;
+        float do_dot_v = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            do_dot_v += __half2float(do_row[d]) * __half2float(v_row[d]);
+        }
+        delta += p * do_dot_v;
+    }
+
+    float dq_acc[MAX_D];
+    for (int d = 0; d < D; ++d) dq_acc[d] = 0.0f;
+
+    for (int j = 0; j < N; ++j) {
+        if (causal && j > q_idx) continue;
+        const half* k_row = K + base + j * D;
+        const half* v_row = V + base + j * D;
+        half* dk_row = dK + base + j * D;
+        half* dv_row = dV + base + j * D;
+
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            score += __half2float(q_row[d]) * __half2float(k_row[d]);
+        }
+        float p = expf(score * scale - m) / l;
+
+        float do_dot_v = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            do_dot_v += __half2float(do_row[d]) * __half2float(v_row[d]);
+        }
+        float ds = p * (do_dot_v - delta) * scale;
+
+        for (int d = 0; d < D; ++d) {
+            dq_acc[d] += ds * __half2float(k_row[d]);
+            atomicAdd(dk_row + d, __float2half(ds * __half2float(q_row[d])));
+            atomicAdd(dv_row + d, __float2half(p * __half2float(do_row[d])));
+        }
+    }
+
+    for (int d = 0; d < D; ++d) {
+        dq_row[d] = __float2half(dq_acc[d]);
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> flash_attn_backward(
+    torch::Tensor dout,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal
+) {
+    CHECK_INPUT(dout);
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(v);
+    check_mha_input_shapes(q, k, v);
+    check_same_shape(dout, q, "dout", "q");
+    CHECK_SAME_DEVICE(dout, q);
+    CHECK_SAME_DTYPE(dout, q);
+    TORCH_CHECK(q.dtype() == torch::kFloat32 || q.dtype() == torch::kHalf, "q, k, v must be float32 or float16");
+
+    auto B = q.size(0);
+    auto H = q.size(1);
+    auto N = q.size(2);
+    auto D = q.size(3);
+
+    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto dq = torch::zeros_like(q);
+    auto dk = torch::zeros_like(k);
+    auto dv = torch::zeros_like(v);
+
+    dim3 grid(B * H * N);
+    dim3 block(1);
+    float scale = 1.0f / std::sqrt((float)D);
+
+    if (q.dtype() == torch::kFloat32) {
+        flash_attn_backward_kernel_fp32<<<grid, block>>>(
+            dout.data_ptr<float>(),
+            q.data_ptr<float>(),
+            k.data_ptr<float>(),
+            v.data_ptr<float>(),
+            dq.data_ptr<float>(),
+            dk.data_ptr<float>(),
+            dv.data_ptr<float>(),
+            B,
+            H,
+            N,
+            D,
+            causal,
+            scale
+        );
+    } else {
+        flash_attn_backward_kernel_fp16<<<grid, block>>>(
+            reinterpret_cast<half*>(dout.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(dq.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(dk.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(dv.data_ptr<at::Half>()),
+            B,
+            H,
+            N,
+            D,
+            causal,
+            scale
+        );
+    }
+    CUDA_KERNEL_CHECK();
+
+    return std::make_tuple(dq, dk, dv);
+}
+
 constexpr int WMMA_Q = 32;
 constexpr int WMMA_KV = 32;
 constexpr int WMMA_WARPS = 2;

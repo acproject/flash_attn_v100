@@ -217,6 +217,7 @@ import flash_attn_v100
 # Prefill 阶段
 flash_attn_v100.forward(q, k, v, causal)              # FP32
 flash_attn_v100.forward_fp16(q, k, v, causal)         # FP16
+flash_attn_v100.backward(dout, q, k, v, causal)       # FP32/FP16 MHA backward
 flash_attn_v100.forward_fp16_warp(q, k, v, causal)    # FP16 + Warp 优化
 flash_attn_v100.forward_fp16_wmma(q, k, v, causal)    # FP16 + WMMA
 
@@ -271,6 +272,23 @@ tp = TensorParallelDecoder(H_Q=32, H_KV=8, D=128, world_size=2)
 out = tp.decode_step(q, k, v, cache_len)  # Multi-GPU decode
 out = tp.decode_step_local(q, kv_caches, cache_len)  # Multi-GPU decode with local KV caches
 ```
+
+### 训练 / 微调 Autograd 封装
+
+```python
+import torch
+from flash_attn_autograd import flash_attn
+
+q = torch.randn(2, 8, 256, 64, device='cuda', dtype=torch.float16, requires_grad=True)
+k = torch.randn(2, 8, 256, 64, device='cuda', dtype=torch.float16, requires_grad=True)
+v = torch.randn(2, 8, 256, 64, device='cuda', dtype=torch.float16, requires_grad=True)
+
+out = flash_attn(q, k, v, causal=True)
+loss = out.float().pow(2).mean()
+loss.backward()
+```
+
+当前 backward 支持标准 MHA 的 `[B, H, N, D]` FP32/FP16 输入，对应 `forward` 和 `forward_fp16`。Decode KV cache、GQA/MQA prefill 和 varlen prefill 的反向传播还没有接入。
 
 ### 参数说明
 
