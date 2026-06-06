@@ -8,10 +8,14 @@ Usage:
 """
 
 import argparse
+import os
 import time
 import uuid
 import json
 from typing import Optional, List, Dict, Any, AsyncIterator
+
+# Reduce CUDA memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -25,12 +29,14 @@ from pydantic import BaseModel
 def load_gemma4_model(
     model_path: str,
     dtype: torch.dtype = torch.float16,
+    gpu_memory_reserved_gb: float = 4.0,
 ):
     """Load Gemma4 31B model with multi-GPU device_map=auto.
 
     Args:
         model_path: Path to the model directory with config.json & safetensors.
         dtype: Target dtype (float16 for V100).
+        gpu_memory_reserved_gb: GB to reserve per GPU for KV cache and activations.
 
     Returns:
         Tuple of (model, processor).
@@ -44,6 +50,16 @@ def load_gemma4_model(
     print(f"[1/3] Loading config from {model_path}...")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
+    # Build max_memory dict: reserve space for KV cache / activations
+    n_gpus = torch.cuda.device_count()
+    max_memory = {}
+    for i in range(n_gpus):
+        total_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+        reserved_gb = min(gpu_memory_reserved_gb, total_gb * 0.15)  # at most 15%
+        max_memory[i] = f"{int(total_gb - reserved_gb)}GiB"
+    max_memory["cpu"] = "32GiB"
+    print(f"  max_memory: {max_memory}")
+
     print(f"[2/3] Loading model with device_map=auto (dtype={dtype})...")
     t0 = time.time()
 
@@ -51,6 +67,7 @@ def load_gemma4_model(
         model_path,
         torch_dtype=dtype,
         device_map="auto",
+        max_memory=max_memory,
         trust_remote_code=True,
     )
     model.eval()
@@ -436,8 +453,15 @@ async def chat_completions(request: ChatCompletionRequest):
         )
 
     # Non-streaming
-    with torch.no_grad():
-        output_ids = _model.generate(**inputs, **gen_kwargs)
+    try:
+        with torch.no_grad():
+            output_ids = _model.generate(**inputs, **gen_kwargs)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise HTTPException(
+            status_code=507,
+            detail="GPU out of memory. Try reducing max_tokens or use a shorter prompt.",
+        )
 
     # Decode only new tokens
     generated_ids = output_ids[0, input_len:]
@@ -539,8 +563,15 @@ async def completions(request: CompletionRequest):
         )
 
     # Non-streaming
-    with torch.no_grad():
-        output_ids = _model.generate(**inputs, **gen_kwargs)
+    try:
+        with torch.no_grad():
+            output_ids = _model.generate(**inputs, **gen_kwargs)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise HTTPException(
+            status_code=507,
+            detail="GPU out of memory. Try reducing max_tokens or use a shorter prompt.",
+        )
 
     # Decode only new tokens
     generated_ids = output_ids[0, input_len:]
