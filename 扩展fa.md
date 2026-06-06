@@ -266,3 +266,7 @@ KV cache correctness
 再做量化、多 GPU、server API。
 一句话总结：
 这个项目现在已经有了很不错的 attention 推理内核地基，但完整 LLM 推理库还缺 模型层、权重加载、tokenizer、GEMM/MLP、KV cache runtime、采样、调度器和 serving API。其中最优先的是 真实模型结构 + 权重加载 + tokenizer + generate loop。
+
+
+### TODO
+要正确支持 D=256 需要对 kernel 进行更深入的重构（如分块计算、动态共享内存等），这是一个较大的工程。
