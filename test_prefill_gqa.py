@@ -46,6 +46,7 @@ def test_prefill_gqa_correctness():
         (1, 8, 4, 64, 256, "GQA (Longer seq)"),
         (1, 8, 4, 128, 128, "GQA (D=128)"),
         (1, 32, 8, 128, 256, "GQA (Llama-like D=128)"),
+        (1, 32, 8, 256, 128, "GQA (Llama-like D=256)"),
     ]
 
     for B, H_Q, H_KV, D, N, name in test_cases:

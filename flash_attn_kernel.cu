@@ -33,10 +33,15 @@ using namespace nvcuda;
 constexpr int TILE_Q = 32;
 constexpr int TILE_K = 32;
 constexpr int MAX_D = 128;
+constexpr int MAX_D_LARGE = 256;
 constexpr int WARP_SIZE = 32;
 constexpr int WARPS_PER_BLOCK = 8;
 constexpr int QUERIES_PER_BLOCK = WARPS_PER_BLOCK;
 constexpr int WARP_BLOCK_SIZE = WARPS_PER_BLOCK * WARP_SIZE;
+constexpr int LARGE_DECODE_TILE_K = 32;
+constexpr int LARGE_PREFILL_TILE_K = 16;
+constexpr int LARGE_PREFILL_QUERIES_PER_BLOCK = 8;
+constexpr int MAX_D_FRAGMENTS = MAX_D_LARGE / WARP_SIZE;
 
 __global__ void flash_attn_kernel_decode_gqa_fp16(
     const half* __restrict__ Q,
@@ -53,6 +58,39 @@ __global__ void flash_attn_kernel_decode_gqa_fp16(
     int cache_len);
 
 __global__ void flash_attn_kernel_prefill_gqa_fp16(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H_Q,
+    int H_KV,
+    int N,
+    int D,
+    bool causal,
+    float scale);
+
+torch::Tensor flash_attn_forward_prefill_gqa_fp16(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal);
+
+__global__ void flash_attn_kernel_decode_gqa_fp16_large(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H_Q,
+    int H_KV,
+    int N,
+    int D,
+    bool causal,
+    float scale,
+    int cache_len);
+
+__global__ void flash_attn_kernel_prefill_gqa_fp16_large(
     const half* __restrict__ Q,
     const half* __restrict__ K,
     const half* __restrict__ V,
@@ -224,26 +262,43 @@ inline void launch_decode_gqa_fp16_on_stream(
     auto H_KV = k.size(1);
     auto N = k.size(2);
     auto D = q.size(3);
-
-    int threads = 128;
-    dim3 grid(B * H_Q);
-    dim3 block(threads);
     float scale = 1.0f / std::sqrt((float)D);
 
-    flash_attn_kernel_decode_gqa_fp16<<<grid, block, 0, stream>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H_Q,
-        H_KV,
-        N,
-        D,
-        causal,
-        scale,
-        cache_len
-    );
+    dim3 grid(B * H_Q);
+    if (D > MAX_D) {
+        size_t smem_bytes = static_cast<size_t>(D + 2 * LARGE_DECODE_TILE_K * D) * sizeof(half);
+        dim3 block(WARP_SIZE);
+        flash_attn_kernel_decode_gqa_fp16_large<<<grid, block, smem_bytes, stream>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            B,
+            H_Q,
+            H_KV,
+            N,
+            D,
+            causal,
+            scale,
+            cache_len
+        );
+    } else {
+        dim3 block(128);
+        flash_attn_kernel_decode_gqa_fp16<<<grid, block, 0, stream>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            B,
+            H_Q,
+            H_KV,
+            N,
+            D,
+            causal,
+            scale,
+            cache_len
+        );
+    }
     CUDA_KERNEL_CHECK();
 }
 
@@ -270,24 +325,43 @@ inline void launch_prefill_gqa_fp16(
     auto H_KV = k.size(1);
     auto N = q.size(2);
     auto D = q.size(3);
-
-    dim3 grid((N + TILE_Q - 1) / TILE_Q, B * H_Q);
-    dim3 block(TILE_Q);
     float scale = 1.0f / std::sqrt((float)D);
 
-    flash_attn_kernel_prefill_gqa_fp16<<<grid, block>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H_Q,
-        H_KV,
-        N,
-        D,
-        causal,
-        scale
-    );
+    if (D > MAX_D) {
+        dim3 grid((N + LARGE_PREFILL_QUERIES_PER_BLOCK - 1) / LARGE_PREFILL_QUERIES_PER_BLOCK, B * H_Q);
+        dim3 block(LARGE_PREFILL_QUERIES_PER_BLOCK * WARP_SIZE);
+        size_t smem_bytes =
+            static_cast<size_t>(LARGE_PREFILL_QUERIES_PER_BLOCK * D + 2 * LARGE_PREFILL_TILE_K * D) * sizeof(half);
+        flash_attn_kernel_prefill_gqa_fp16_large<<<grid, block, smem_bytes>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            B,
+            H_Q,
+            H_KV,
+            N,
+            D,
+            causal,
+            scale
+        );
+    } else {
+        dim3 grid((N + TILE_Q - 1) / TILE_Q, B * H_Q);
+        dim3 block(TILE_Q);
+        flash_attn_kernel_prefill_gqa_fp16<<<grid, block>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            B,
+            H_Q,
+            H_KV,
+            N,
+            D,
+            causal,
+            scale
+        );
+    }
     CUDA_KERNEL_CHECK();
 }
 
@@ -703,6 +777,298 @@ __device__ inline float warp_reduce_max(float val) {
         val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     }
     return val;
+}
+
+// D>128 path:
+// - decode: one warp handles one (batch, q_head), K/V staged with dynamic shared memory
+// - prefill: one block handles multiple queries, each warp owns one query row and one D-slice
+__global__ void flash_attn_kernel_decode_gqa_fp16_large(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H_Q,
+    int H_KV,
+    int N,
+    int D,
+    bool causal,
+    float scale,
+    int cache_len
+) {
+    int bqh = blockIdx.x;
+    int b = bqh / H_Q;
+    int h_q = bqh % H_Q;
+    int h_kv = h_q / (H_Q / H_KV);
+
+    int lane_id = threadIdx.x;
+
+    const half* Q_ptr = Q + ((b * H_Q + h_q) * D);
+    const half* K_ptr = K + ((b * H_KV + h_kv) * N * D);
+    const half* V_ptr = V + ((b * H_KV + h_kv) * N * D);
+    half* O_ptr = O + ((b * H_Q + h_q) * D);
+
+    extern __shared__ half shared_mem[];
+    half* sQ = shared_mem;
+    half* sK = sQ + D;
+    half* sV = sK + LARGE_DECODE_TILE_K * D;
+
+    for (int d = lane_id; d < D; d += WARP_SIZE) {
+        sQ[d] = Q_ptr[d];
+    }
+    __syncthreads();
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.f;
+    float acc[MAX_D_FRAGMENTS];
+    #pragma unroll
+    for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+        acc[frag] = 0.f;
+    }
+
+    int num_kv_blocks = (N + LARGE_DECODE_TILE_K - 1) / LARGE_DECODE_TILE_K;
+    for (int block_idx = 0; block_idx < num_kv_blocks; ++block_idx) {
+        int k_start = block_idx * LARGE_DECODE_TILE_K;
+        int k_len = min(LARGE_DECODE_TILE_K, N - k_start);
+
+        for (int idx = lane_id; idx < k_len * D; idx += WARP_SIZE) {
+            int row = idx / D;
+            int col = idx % D;
+            sK[idx] = K_ptr[(k_start + row) * D + col];
+            sV[idx] = V_ptr[(k_start + row) * D + col];
+        }
+        __syncthreads();
+
+        float scores[LARGE_DECODE_TILE_K];
+        float m_block = -FLT_MAX;
+        for (int j = 0; j < k_len; ++j) {
+            int k_idx = k_start + j;
+            if (causal && k_idx > cache_len) {
+                scores[j] = -FLT_MAX;
+                continue;
+            }
+
+            float dot = 0.0f;
+            #pragma unroll
+            for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                int d = lane_id + frag * WARP_SIZE;
+                if (d < D) {
+                    dot += __half2float(sQ[d]) * __half2float(sK[j * D + d]);
+                }
+            }
+            dot = warp_reduce_sum(dot);
+            dot = __shfl_sync(0xffffffff, dot, 0);
+            if (lane_id == 0) {
+                dot *= scale;
+            }
+            dot = __shfl_sync(0xffffffff, dot, 0);
+            scores[j] = dot;
+            m_block = fmaxf(m_block, dot);
+        }
+
+        m_block = warp_reduce_max(m_block);
+        m_block = __shfl_sync(0xffffffff, m_block, 0);
+        if (m_block == -FLT_MAX) {
+            __syncthreads();
+            continue;
+        }
+
+        float m_new = fmaxf(m_i, m_block);
+        float alpha = (m_i == -FLT_MAX) ? 0.f : expf(m_i - m_new);
+
+        float weighted[MAX_D_FRAGMENTS];
+        #pragma unroll
+        for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+            weighted[frag] = 0.f;
+        }
+
+        float beta_sum = 0.f;
+        for (int j = 0; j < k_len; ++j) {
+            if (scores[j] == -FLT_MAX) continue;
+
+            float p = expf(scores[j] - m_new);
+            if (lane_id == 0) {
+                beta_sum += p;
+            }
+            #pragma unroll
+            for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                int d = lane_id + frag * WARP_SIZE;
+                if (d < D) {
+                    weighted[frag] += __half2float(sV[j * D + d]) * p;
+                }
+            }
+        }
+
+        beta_sum = __shfl_sync(0xffffffff, beta_sum, 0);
+        #pragma unroll
+        for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+            int d = lane_id + frag * WARP_SIZE;
+            if (d < D) {
+                acc[frag] = alpha * acc[frag] + weighted[frag];
+            }
+        }
+        l_i = alpha * l_i + beta_sum;
+        m_i = m_new;
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+        int d = lane_id + frag * WARP_SIZE;
+        if (d < D) {
+            O_ptr[d] = __float2half(acc[frag] / l_i);
+        }
+    }
+}
+
+__global__ void flash_attn_kernel_prefill_gqa_fp16_large(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    int B,
+    int H_Q,
+    int H_KV,
+    int N,
+    int D,
+    bool causal,
+    float scale
+) {
+    int q_tile_idx = blockIdx.x;
+    int bhq = blockIdx.y;
+
+    int b = bhq / H_Q;
+    int h_q = bhq % H_Q;
+    int h_kv = h_q / (H_Q / H_KV);
+
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    int q_start = q_tile_idx * LARGE_PREFILL_QUERIES_PER_BLOCK;
+    int q_count = min(LARGE_PREFILL_QUERIES_PER_BLOCK, N - q_start);
+    bool is_active = (q_start < N) && (warp_id < q_count);
+    int q_idx = q_start + warp_id;
+
+    const half* Q_ptr = Q + ((b * H_Q + h_q) * N * D);
+    const half* K_ptr = K + ((b * H_KV + h_kv) * N * D);
+    const half* V_ptr = V + ((b * H_KV + h_kv) * N * D);
+    half* O_ptr = O + ((b * H_Q + h_q) * N * D);
+
+    extern __shared__ half shared_mem[];
+    half* sQ = shared_mem;
+    half* sK = sQ + LARGE_PREFILL_QUERIES_PER_BLOCK * D;
+    half* sV = sK + LARGE_PREFILL_TILE_K * D;
+
+    if (is_active) {
+        const half* q_row = Q_ptr + q_idx * D;
+        for (int d = lane_id; d < D; d += WARP_SIZE) {
+            sQ[warp_id * D + d] = q_row[d];
+        }
+    }
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.f;
+    float acc[MAX_D_FRAGMENTS];
+    #pragma unroll
+    for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+        acc[frag] = 0.f;
+    }
+
+    __syncthreads();
+
+    for (int k_start = 0; k_start < N; k_start += LARGE_PREFILL_TILE_K) {
+        int k_len = min(LARGE_PREFILL_TILE_K, N - k_start);
+
+        for (int idx = tid; idx < k_len * D; idx += blockDim.x) {
+            int row = idx / D;
+            int col = idx % D;
+            sK[idx] = K_ptr[(k_start + row) * D + col];
+            sV[idx] = V_ptr[(k_start + row) * D + col];
+        }
+        __syncthreads();
+
+        if (is_active) {
+            float scores[LARGE_PREFILL_TILE_K];
+            float m_block = -FLT_MAX;
+
+            for (int j = 0; j < k_len; ++j) {
+                int k_idx = k_start + j;
+                if (causal && k_idx > q_idx) {
+                    scores[j] = -FLT_MAX;
+                    continue;
+                }
+
+                float dot = 0.0f;
+                #pragma unroll
+                for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                    int d = lane_id + frag * WARP_SIZE;
+                    if (d < D) {
+                        dot += __half2float(sQ[warp_id * D + d]) * __half2float(sK[j * D + d]);
+                    }
+                }
+                dot = warp_reduce_sum(dot);
+                dot = __shfl_sync(0xffffffff, dot, 0);
+                if (lane_id == 0) {
+                    dot *= scale;
+                }
+                dot = __shfl_sync(0xffffffff, dot, 0);
+                scores[j] = dot;
+                m_block = fmaxf(m_block, dot);
+            }
+
+            m_block = warp_reduce_max(m_block);
+            m_block = __shfl_sync(0xffffffff, m_block, 0);
+            if (m_block != -FLT_MAX) {
+                float m_new = fmaxf(m_i, m_block);
+                float alpha = (m_i == -FLT_MAX) ? 0.f : expf(m_i - m_new);
+
+                float weighted[MAX_D_FRAGMENTS];
+                #pragma unroll
+                for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                    weighted[frag] = 0.f;
+                }
+
+                float beta_sum = 0.f;
+                for (int j = 0; j < k_len; ++j) {
+                    if (scores[j] == -FLT_MAX) continue;
+
+                    float p = expf(scores[j] - m_new);
+                    if (lane_id == 0) {
+                        beta_sum += p;
+                    }
+                    #pragma unroll
+                    for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                        int d = lane_id + frag * WARP_SIZE;
+                        if (d < D) {
+                            weighted[frag] += __half2float(sV[j * D + d]) * p;
+                        }
+                    }
+                }
+
+                beta_sum = __shfl_sync(0xffffffff, beta_sum, 0);
+                #pragma unroll
+                for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                    int d = lane_id + frag * WARP_SIZE;
+                    if (d < D) {
+                        acc[frag] = alpha * acc[frag] + weighted[frag];
+                    }
+                }
+                l_i = alpha * l_i + beta_sum;
+                m_i = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (is_active) {
+        #pragma unroll
+        for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+            int d = lane_id + frag * WARP_SIZE;
+            if (d < D) {
+                O_ptr[q_idx * D + d] = __float2half(acc[frag] / l_i);
+            }
+        }
+    }
 }
 
 // WMMA QK^T 计算：一个 warp 处理 16x16 score tile
@@ -1456,7 +1822,7 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16(
     auto N = k.size(2);  // K/V 的长度（包含 cache）
     auto D = q.size(3);
 
-    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be less than or equal to MAX_D_LARGE(256)");
     check_cache_len(cache_len, N);
 
     c10::cuda::CUDAGuard device_guard(q.device());
@@ -1486,7 +1852,7 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16_out(
     auto H_KV = k.size(1);
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(q.size(3) <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    TORCH_CHECK(q.size(3) <= MAX_D_LARGE, "D must be less than or equal to MAX_D_LARGE(256)");
     check_cache_len(cache_len, k.size(2));
     
     c10::cuda::CUDAGuard device_guard(q.device());
@@ -1513,34 +1879,35 @@ torch::Tensor flash_attn_forward_decode_fp16(
     auto N = k.size(2);  // K/V 的长度（包含 cache）
     auto D = q.size(3);
 
-    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be less than or equal to MAX_D_LARGE(256)");
     check_cache_len(cache_len, N);
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H, 1, D}, q.options());
 
-    // 每个 block 处理一个 (batch, head)
-    // 使用 128 或 256 个线程（根据 D 的大小调整）
-    int threads = 128;
-    dim3 grid(B * H);
-    dim3 block(threads);
+    if (D > MAX_D) {
+        launch_decode_gqa_fp16(q, k, v, out, causal, cache_len);
+    } else {
+        int threads = 128;
+        dim3 grid(B * H);
+        dim3 block(threads);
+        float scale = 1.0f / std::sqrt((float)D);
 
-    float scale = 1.0f / std::sqrt((float)D);
-
-    flash_attn_kernel_decode_fp16<<<grid, block>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H,
-        N,
-        D,
-        causal,
-        scale,
-        cache_len
-    );
-    CUDA_KERNEL_CHECK();
+        flash_attn_kernel_decode_fp16<<<grid, block>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            B,
+            H,
+            N,
+            D,
+            causal,
+            scale,
+            cache_len
+        );
+        CUDA_KERNEL_CHECK();
+    }
     
     return out;
 }
@@ -1562,7 +1929,11 @@ torch::Tensor flash_attn_forward_fp16(
     auto N = q.size(2);
     auto D = q.size(3);
 
-    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be less than or equal to MAX_D_LARGE(256)");
+
+    if (D > MAX_D) {
+        return flash_attn_forward_prefill_gqa_fp16(q, k, v, causal);
+    }
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
@@ -2386,7 +2757,7 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16(
 
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
     TORCH_CHECK(k.size(2) == N, "k sequence length must match q");
     TORCH_CHECK(v.size(2) == N, "v sequence length must match q");
 
@@ -2415,7 +2786,7 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16_out(
     auto H_KV = k.size(1);
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(q.size(3) <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(q.size(3) <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
 
     c10::cuda::CUDAGuard device_guard(q.device());
     launch_prefill_gqa_fp16(q, k, v, out, causal);
@@ -3102,17 +3473,11 @@ torch::Tensor flash_attn_forward_decode_gqa_fp16_stream(
     auto N = k.size(2);
     auto D = q.size(3);
 
-    TORCH_CHECK(D <= MAX_D, "D must be less than or equal to MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be less than or equal to MAX_D_LARGE(256)");
     check_cache_len(cache_len, N);
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
-
-    int threads = 128;
-    dim3 grid(B * H_Q);
-    dim3 block(threads);
-
-    float scale = 1.0f / std::sqrt((float)D);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_int);
 
@@ -3275,7 +3640,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> pipeline_decode_step_out
     check_decode_gqa_output_tensor(out, q_compute);
 
     auto N = k_compute.size(2);
-    TORCH_CHECK(q_compute.size(3) <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(q_compute.size(3) <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
     check_cache_len(cache_len, N);
     TORCH_CHECK(!q_transfer.is_cuda() && !k_transfer.is_cuda() && !v_transfer.is_cuda(),
                 "transfer source tensors must be CPU tensors");

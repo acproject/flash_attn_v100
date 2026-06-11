@@ -5,3 +5,4 @@ build
 *.pyc
 flash_attn_v100.egg-info
 dist
+.vscode
