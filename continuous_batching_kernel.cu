@@ -14,11 +14,16 @@
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
 
 constexpr int MAX_D_CB = 128;
+constexpr int MAX_D_CB_LARGE = 256;
+constexpr int WARP_SIZE_CB = 32;
+constexpr int CONT_BATCH_TILE_K = 64;
+constexpr int CONT_BATCH_TILE_K_LARGE = 32;
+constexpr int MAX_D_CB_FRAGMENTS = MAX_D_CB_LARGE / WARP_SIZE_CB;
 
 // Warp-level Reduction 辅助函数
 __device__ inline float warp_reduce_sum(float val) {
     #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
+    for (int offset = WARP_SIZE_CB / 2; offset > 0; offset /= 2) {
         val += __shfl_down_sync(0xffffffff, val, offset);
     }
     return val;
@@ -26,7 +31,7 @@ __device__ inline float warp_reduce_sum(float val) {
 
 __device__ inline float warp_reduce_max(float val) {
     #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
+    for (int offset = WARP_SIZE_CB / 2; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     }
     return val;
@@ -55,7 +60,7 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
     int h_kv = h_q / (H_Q / H_KV);
 
     int tid = threadIdx.x;
-    int lane_id = tid % 32;
+    int lane_id = tid % WARP_SIZE_CB;
 
     // 获取当前 batch 的实际长度
     int current_cache_len = cache_lens[b];
@@ -87,15 +92,14 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
     __syncthreads();
 
     // 分块处理 K/V
-    constexpr int TILE_K_DECODE = 64;
-    int num_kv_blocks = (current_N + TILE_K_DECODE - 1) / TILE_K_DECODE;
+    int num_kv_blocks = (current_N + CONT_BATCH_TILE_K - 1) / CONT_BATCH_TILE_K;
 
-    __shared__ half sK[TILE_K_DECODE][MAX_D_CB];
-    __shared__ half sV[TILE_K_DECODE][MAX_D_CB];
+    __shared__ half sK[CONT_BATCH_TILE_K][MAX_D_CB];
+    __shared__ half sV[CONT_BATCH_TILE_K][MAX_D_CB];
 
     for (int block_idx = 0; block_idx < num_kv_blocks; ++block_idx) {
-        int k_start = block_idx * TILE_K_DECODE;
-        int k_len = min(TILE_K_DECODE, current_N - k_start);
+        int k_start = block_idx * CONT_BATCH_TILE_K;
+        int k_len = min(CONT_BATCH_TILE_K, current_N - k_start);
 
         // 协作加载 K/V
         int total_elements = k_len * D;
@@ -108,7 +112,7 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
         __syncthreads();
 
         // 计算 attention scores
-        float scores[TILE_K_DECODE];
+        float scores[CONT_BATCH_TILE_K];
         float m_block = -FLT_MAX;
 
         for (int j = 0; j < k_len; ++j) {
@@ -123,7 +127,7 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
             // 计算点积
             float dot = 0.0f;
             #pragma unroll
-            for (int d = lane_id; d < D; d += 32) {
+            for (int d = lane_id; d < D; d += WARP_SIZE_CB) {
                 dot += __half2float(sQ[d]) * __half2float(sK[j][d]);
             }
             
@@ -190,6 +194,146 @@ __global__ void flash_attn_kernel_continuous_batching_fp16(
     }
 }
 
+__global__ void flash_attn_kernel_continuous_batching_fp16_large(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    const int* __restrict__ cache_lens,
+    int B,
+    int H_Q,
+    int H_KV,
+    int max_N,
+    int D,
+    bool causal,
+    float scale
+) {
+    int bqh = blockIdx.x;
+    int b = bqh / H_Q;
+    int h_q = bqh % H_Q;
+    int h_kv = h_q / (H_Q / H_KV);
+    int lane_id = threadIdx.x;
+
+    int current_cache_len = cache_lens[b];
+    int current_N = min(current_cache_len + 1, max_N);
+
+    const half* Q_ptr = Q + ((b * H_Q + h_q) * D);
+    const half* K_ptr = K + ((b * H_KV + h_kv) * max_N * D);
+    const half* V_ptr = V + ((b * H_KV + h_kv) * max_N * D);
+    half* O_ptr = O + ((b * H_Q + h_q) * D);
+
+    extern __shared__ half shared_mem[];
+    half* sQ = shared_mem;
+    half* sK = sQ + D;
+    half* sV = sK + CONT_BATCH_TILE_K_LARGE * D;
+
+    for (int d = lane_id; d < D; d += WARP_SIZE_CB) {
+        sQ[d] = Q_ptr[d];
+    }
+    __syncthreads();
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.f;
+    float acc[MAX_D_CB_FRAGMENTS];
+    #pragma unroll
+    for (int frag = 0; frag < MAX_D_CB_FRAGMENTS; ++frag) {
+        acc[frag] = 0.f;
+    }
+
+    int num_kv_blocks = (current_N + CONT_BATCH_TILE_K_LARGE - 1) / CONT_BATCH_TILE_K_LARGE;
+    for (int block_idx = 0; block_idx < num_kv_blocks; ++block_idx) {
+        int k_start = block_idx * CONT_BATCH_TILE_K_LARGE;
+        int k_len = min(CONT_BATCH_TILE_K_LARGE, current_N - k_start);
+
+        for (int idx = lane_id; idx < k_len * D; idx += WARP_SIZE_CB) {
+            int row = idx / D;
+            int col = idx % D;
+            sK[idx] = K_ptr[(k_start + row) * D + col];
+            sV[idx] = V_ptr[(k_start + row) * D + col];
+        }
+        __syncthreads();
+
+        float scores[CONT_BATCH_TILE_K_LARGE];
+        float m_block = -FLT_MAX;
+
+        for (int j = 0; j < k_len; ++j) {
+            int k_idx = k_start + j;
+            if (causal && k_idx > current_cache_len) {
+                scores[j] = -FLT_MAX;
+                continue;
+            }
+
+            float dot = 0.f;
+            #pragma unroll
+            for (int frag = 0; frag < MAX_D_CB_FRAGMENTS; ++frag) {
+                int d = lane_id + frag * WARP_SIZE_CB;
+                if (d < D) {
+                    dot += __half2float(sQ[d]) * __half2float(sK[j * D + d]);
+                }
+            }
+            dot = warp_reduce_sum(dot);
+            dot = __shfl_sync(0xffffffff, dot, 0);
+            if (lane_id == 0) {
+                dot *= scale;
+            }
+            dot = __shfl_sync(0xffffffff, dot, 0);
+            scores[j] = dot;
+            m_block = fmaxf(m_block, dot);
+        }
+
+        m_block = warp_reduce_max(m_block);
+        m_block = __shfl_sync(0xffffffff, m_block, 0);
+        if (m_block == -FLT_MAX) {
+            __syncthreads();
+            continue;
+        }
+
+        float m_new = fmaxf(m_i, m_block);
+        float alpha = (m_i == -FLT_MAX) ? 0.f : expf(m_i - m_new);
+        float beta_sum = 0.f;
+        float weighted[MAX_D_CB_FRAGMENTS];
+        #pragma unroll
+        for (int frag = 0; frag < MAX_D_CB_FRAGMENTS; ++frag) {
+            weighted[frag] = 0.f;
+        }
+
+        for (int j = 0; j < k_len; ++j) {
+            if (scores[j] == -FLT_MAX) continue;
+            float p = expf(scores[j] - m_new);
+            if (lane_id == 0) {
+                beta_sum += p;
+            }
+            #pragma unroll
+            for (int frag = 0; frag < MAX_D_CB_FRAGMENTS; ++frag) {
+                int d = lane_id + frag * WARP_SIZE_CB;
+                if (d < D) {
+                    weighted[frag] += __half2float(sV[j * D + d]) * p;
+                }
+            }
+        }
+
+        beta_sum = __shfl_sync(0xffffffff, beta_sum, 0);
+        #pragma unroll
+        for (int frag = 0; frag < MAX_D_CB_FRAGMENTS; ++frag) {
+            int d = lane_id + frag * WARP_SIZE_CB;
+            if (d < D) {
+                acc[frag] = alpha * acc[frag] + weighted[frag];
+            }
+        }
+        l_i = alpha * l_i + beta_sum;
+        m_i = m_new;
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int frag = 0; frag < MAX_D_CB_FRAGMENTS; ++frag) {
+        int d = lane_id + frag * WARP_SIZE_CB;
+        if (d < D) {
+            O_ptr[d] = __float2half(acc[frag] / l_i);
+        }
+    }
+}
+
 // Continuous Batching 接口
 torch::Tensor flash_attn_forward_continuous_batching_fp16(
     torch::Tensor q,          // [B, H_Q, 1, D]
@@ -216,31 +360,47 @@ torch::Tensor flash_attn_forward_continuous_batching_fp16(
 
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(D <= MAX_D_CB, "D must be <= MAX_D_CB(128)");
+    TORCH_CHECK(D <= MAX_D_CB_LARGE, "D must be <= MAX_D_CB_LARGE(256)");
 
     auto out = torch::zeros({B, H_Q, 1, D}, q.options());
 
-    // 每个 block 处理一个 (batch, q_head)
-    int threads = 128;
-    dim3 grid(B * H_Q);
-    dim3 block(threads);
-
     float scale = 1.0f / std::sqrt((float)D);
+    dim3 grid(B * H_Q);
 
-    flash_attn_kernel_continuous_batching_fp16<<<grid, block>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        cache_lens.data_ptr<int>(),
-        B,
-        H_Q,
-        H_KV,
-        max_N,
-        D,
-        causal,
-        scale
-    );
+    if (D > MAX_D_CB) {
+        dim3 block(WARP_SIZE_CB);
+        size_t smem_bytes = static_cast<size_t>(D + 2 * CONT_BATCH_TILE_K_LARGE * D) * sizeof(half);
+        flash_attn_kernel_continuous_batching_fp16_large<<<grid, block, smem_bytes>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            cache_lens.data_ptr<int>(),
+            B,
+            H_Q,
+            H_KV,
+            max_N,
+            D,
+            causal,
+            scale
+        );
+    } else {
+        dim3 block(128);
+        flash_attn_kernel_continuous_batching_fp16<<<grid, block>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            cache_lens.data_ptr<int>(),
+            B,
+            H_Q,
+            H_KV,
+            max_N,
+            D,
+            causal,
+            scale
+        );
+    }
     
     return out;
 }

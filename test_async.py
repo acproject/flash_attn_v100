@@ -70,38 +70,47 @@ def test_stream_varlen_prefill_correctness():
     print("Test 2: Stream Varlen Prefill Correctness")
     print("=" * 60)
 
-    H, D = 4, 64
-    seq_lens = [64, 128, 256]
-    torch.manual_seed(42)
+    test_cases = [
+        (4, 64, [64, 128, 256]),
+        (8, 256, [32, 64, 96]),
+    ]
 
-    total_q = sum(seq_lens)
-    q_packed = torch.randn(total_q, H, D, device='cuda', dtype=torch.float16)
-    k_packed = torch.randn(total_q, H, D, device='cuda', dtype=torch.float16)
-    v_packed = torch.randn(total_q, H, D, device='cuda', dtype=torch.float16)
+    ok = True
+    for H, D, seq_lens in test_cases:
+        torch.manual_seed(42)
 
-    cu_seqlens = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0)),
-                              device='cuda', dtype=torch.int32)
-    max_seqlen = max(seq_lens)
+        total_q = sum(seq_lens)
+        q_packed = torch.randn(total_q, H, D, device='cuda', dtype=torch.float16)
+        k_packed = torch.randn(total_q, H, D, device='cuda', dtype=torch.float16)
+        v_packed = torch.randn(total_q, H, D, device='cuda', dtype=torch.float16)
 
-    out_default = flash_attn_v100.forward_varlen_prefill_fp16(
-        q_packed, k_packed, v_packed, cu_seqlens, max_seqlen, True
-    )
+        cu_seqlens = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0)),
+                                  device='cuda', dtype=torch.int32)
+        max_seqlen = max(seq_lens)
 
-    stream = torch.cuda.Stream()
-    stream_ptr = stream.cuda_stream
-
-    with torch.cuda.stream(stream):
-        out_stream = flash_attn_v100.forward_varlen_prefill_fp16_stream(
-            q_packed, k_packed, v_packed, cu_seqlens, max_seqlen, True, stream_ptr
+        out_default = flash_attn_v100.forward_varlen_prefill_fp16(
+            q_packed, k_packed, v_packed, cu_seqlens, max_seqlen, True
         )
 
-    torch.cuda.synchronize()
+        stream = torch.cuda.Stream()
+        stream_ptr = stream.cuda_stream
 
-    diff = (out_default.float() - out_stream.float()).abs().max().item()
-    print(f"  H={H}, D={D}, seq_lens={seq_lens}")
-    print(f"  Max diff (stream vs default): {diff:.8f}")
-    print(f"  Result: {'PASS' if diff < 1e-5 else 'FAIL'}")
-    return diff < 1e-5
+        with torch.cuda.stream(stream):
+            out_stream = flash_attn_v100.forward_varlen_prefill_fp16_stream(
+                q_packed, k_packed, v_packed, cu_seqlens, max_seqlen, True, stream_ptr
+            )
+
+        torch.cuda.synchronize()
+
+        diff = (out_default.float() - out_stream.float()).abs().max().item()
+        passed = diff < 1e-5
+        print(f"  H={H}, D={D}, seq_lens={seq_lens}")
+        print(f"  Max diff (stream vs default): {diff:.8f}")
+        print(f"  Case result: {'PASS' if passed else 'FAIL'}")
+        ok = ok and passed
+
+    print(f"  Result: {'PASS' if ok else 'FAIL'}")
+    return ok
 
 
 def test_async_h2d_transfer():

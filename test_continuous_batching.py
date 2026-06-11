@@ -355,23 +355,27 @@ def test_continuous_batching_fp16_correctness():
         print("CUDA not available, skipping.")
         return True
 
-    torch.manual_seed(0)
-    B, H_Q, H_KV, D = 3, 8, 2, 64
-    max_N = 17
-    cache_lens = torch.tensor([0, 3, 15], device="cuda", dtype=torch.int32)
-
-    q = torch.randn(B, H_Q, 1, D, device="cuda", dtype=torch.float16).contiguous()
-    k = torch.randn(B, H_KV, max_N, D, device="cuda", dtype=torch.float16).contiguous()
-    v = torch.randn(B, H_KV, max_N, D, device="cuda", dtype=torch.float16).contiguous()
+    test_cases = [
+        (3, 8, 2, 64, 17, [0, 3, 15], "D=64"),
+        (2, 32, 8, 256, 33, [0, 31], "D=256"),
+    ]
 
     ok = True
-    for causal in (False, True):
-        out = flash_attn_v100.forward_continuous_batching_fp16(q, k, v, cache_lens, causal)
-        ref = reference_continuous_batching_decode(q, k, v, cache_lens, causal)
-        max_diff = (out.float() - ref.float()).abs().max().item()
-        all_close = torch.allclose(out, ref, atol=1e-2, rtol=1e-2)
-        print(f"  causal={causal} | max_diff={max_diff:.6f} | allclose={all_close}")
-        ok = ok and all_close
+    for B, H_Q, H_KV, D, max_N, cache_lens_list, name in test_cases:
+        torch.manual_seed(0)
+        cache_lens = torch.tensor(cache_lens_list, device="cuda", dtype=torch.int32)
+        q = torch.randn(B, H_Q, 1, D, device="cuda", dtype=torch.float16).contiguous()
+        k = torch.randn(B, H_KV, max_N, D, device="cuda", dtype=torch.float16).contiguous()
+        v = torch.randn(B, H_KV, max_N, D, device="cuda", dtype=torch.float16).contiguous()
+
+        print(f"\n  Case {name}: B={B}, H_Q={H_Q}, H_KV={H_KV}, max_N={max_N}, cache_lens={cache_lens_list}")
+        for causal in (False, True):
+            out = flash_attn_v100.forward_continuous_batching_fp16(q, k, v, cache_lens, causal)
+            ref = reference_continuous_batching_decode(q, k, v, cache_lens, causal)
+            max_diff = (out.float() - ref.float()).abs().max().item()
+            all_close = torch.allclose(out, ref, atol=1e-2, rtol=1e-2)
+            print(f"    causal={causal} | max_diff={max_diff:.6f} | allclose={all_close}")
+            ok = ok and all_close
 
     print(f"Result: {'PASS' if ok else 'FAIL'}")
     return ok

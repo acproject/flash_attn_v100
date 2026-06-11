@@ -2965,7 +2965,7 @@ torch::Tensor flash_attn_forward_decode_int8_gqa(
 
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
     TORCH_CHECK(q_scale.size(0) == B && q_scale.size(1) == H_Q, "q_scale must be [B, H_Q]");
     TORCH_CHECK(k_scale.size(0) == B && k_scale.size(1) == H_KV && k_scale.size(2) == N,
                 "k_scale must be [B, H_KV, N]");
@@ -3147,6 +3147,210 @@ __global__ void flash_attn_kernel_varlen_prefill_fp16(
     }
 }
 
+__global__ void flash_attn_kernel_varlen_prefill_fp16_large(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    const int* __restrict__ cu_seqlens,
+    int H,
+    int total_q,
+    int D,
+    bool causal,
+    float scale
+) {
+    int q_tile_idx = blockIdx.x;
+    int h = blockIdx.y;
+    int batch_idx = blockIdx.z;
+
+    int seq_start = cu_seqlens[batch_idx];
+    int seq_end = cu_seqlens[batch_idx + 1];
+    int seq_len = seq_end - seq_start;
+    if (seq_len == 0) return;
+
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    int q_start = seq_start + q_tile_idx * LARGE_PREFILL_QUERIES_PER_BLOCK;
+
+    if (q_start >= seq_end) return;
+    int q_count = min(LARGE_PREFILL_QUERIES_PER_BLOCK, seq_end - q_start);
+    bool is_active = warp_id < q_count;
+    int q_idx = q_start + warp_id;
+
+    const half* Q_ptr = Q + h * D;
+    const half* K_ptr = K + h * D;
+    const half* V_ptr = V + h * D;
+    half* O_ptr = O + h * D;
+
+    extern __shared__ half shared_mem[];
+    half* sQ = shared_mem;
+    half* sK = sQ + LARGE_PREFILL_QUERIES_PER_BLOCK * D;
+    half* sV = sK + LARGE_PREFILL_TILE_K * D;
+
+    if (is_active) {
+        const half* q_row = Q_ptr + q_idx * H * D;
+        for (int d = lane_id; d < D; d += WARP_SIZE) {
+            sQ[warp_id * D + d] = q_row[d];
+        }
+    }
+
+    float m_i = -FLT_MAX;
+    float l_i = 0.f;
+    float acc[MAX_D_FRAGMENTS];
+    #pragma unroll
+    for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+        acc[frag] = 0.f;
+    }
+
+    __syncthreads();
+
+    for (int k_start = seq_start; k_start < seq_end; k_start += LARGE_PREFILL_TILE_K) {
+        int k_len = min(LARGE_PREFILL_TILE_K, seq_end - k_start);
+
+        for (int idx = tid; idx < k_len * D; idx += blockDim.x) {
+            int row = idx / D;
+            int col = idx % D;
+            sK[idx] = K_ptr[(k_start + row) * H * D + col];
+            sV[idx] = V_ptr[(k_start + row) * H * D + col];
+        }
+        __syncthreads();
+
+        if (is_active) {
+            float scores[LARGE_PREFILL_TILE_K];
+            float m_block = -FLT_MAX;
+
+            for (int j = 0; j < k_len; ++j) {
+                int k_idx = k_start + j;
+                if (causal && k_idx > q_idx) {
+                    scores[j] = -FLT_MAX;
+                    continue;
+                }
+
+                float dot = 0.f;
+                #pragma unroll
+                for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                    int d = lane_id + frag * WARP_SIZE;
+                    if (d < D) {
+                        dot += __half2float(sQ[warp_id * D + d]) * __half2float(sK[j * D + d]);
+                    }
+                }
+                dot = warp_reduce_sum(dot);
+                dot = __shfl_sync(0xffffffff, dot, 0);
+                if (lane_id == 0) {
+                    dot *= scale;
+                }
+                dot = __shfl_sync(0xffffffff, dot, 0);
+                scores[j] = dot;
+                m_block = fmaxf(m_block, dot);
+            }
+
+            m_block = warp_reduce_max(m_block);
+            m_block = __shfl_sync(0xffffffff, m_block, 0);
+            if (m_block != -FLT_MAX) {
+                float m_new = fmaxf(m_i, m_block);
+                float alpha = (m_i == -FLT_MAX) ? 0.f : expf(m_i - m_new);
+                float weighted[MAX_D_FRAGMENTS];
+                #pragma unroll
+                for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                    weighted[frag] = 0.f;
+                }
+
+                float beta_sum = 0.f;
+                for (int j = 0; j < k_len; ++j) {
+                    if (scores[j] == -FLT_MAX) continue;
+
+                    float p = expf(scores[j] - m_new);
+                    if (lane_id == 0) {
+                        beta_sum += p;
+                    }
+                    #pragma unroll
+                    for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                        int d = lane_id + frag * WARP_SIZE;
+                        if (d < D) {
+                            weighted[frag] += __half2float(sV[j * D + d]) * p;
+                        }
+                    }
+                }
+
+                beta_sum = __shfl_sync(0xffffffff, beta_sum, 0);
+                #pragma unroll
+                for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+                    int d = lane_id + frag * WARP_SIZE;
+                    if (d < D) {
+                        acc[frag] = alpha * acc[frag] + weighted[frag];
+                    }
+                }
+                l_i = alpha * l_i + beta_sum;
+                m_i = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (is_active) {
+        #pragma unroll
+        for (int frag = 0; frag < MAX_D_FRAGMENTS; ++frag) {
+            int d = lane_id + frag * WARP_SIZE;
+            if (d < D) {
+                O_ptr[q_idx * H * D + d] = __float2half(acc[frag] / l_i);
+            }
+        }
+    }
+}
+
+inline void launch_varlen_prefill_fp16_on_stream(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& cu_seqlens,
+    int max_seqlen,
+    torch::Tensor& out,
+    bool causal,
+    cudaStream_t stream = nullptr
+) {
+    auto total_q = q.size(0);
+    auto H = q.size(1);
+    auto D = q.size(2);
+    auto batch_size = cu_seqlens.size(0) - 1;
+    float scale = 1.0f / std::sqrt((float)D);
+
+    if (D > MAX_D) {
+        dim3 grid((max_seqlen + LARGE_PREFILL_QUERIES_PER_BLOCK - 1) / LARGE_PREFILL_QUERIES_PER_BLOCK, H, batch_size);
+        dim3 block(LARGE_PREFILL_QUERIES_PER_BLOCK * WARP_SIZE);
+        size_t smem_bytes =
+            static_cast<size_t>(LARGE_PREFILL_QUERIES_PER_BLOCK * D + 2 * LARGE_PREFILL_TILE_K * D) * sizeof(half);
+        flash_attn_kernel_varlen_prefill_fp16_large<<<grid, block, smem_bytes, stream>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            cu_seqlens.data_ptr<int>(),
+            H,
+            total_q,
+            D,
+            causal,
+            scale
+        );
+    } else {
+        dim3 grid((max_seqlen + TILE_Q - 1) / TILE_Q, H, batch_size);
+        dim3 block(TILE_Q);
+        flash_attn_kernel_varlen_prefill_fp16<<<grid, block, 0, stream>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            cu_seqlens.data_ptr<int>(),
+            H,
+            total_q,
+            D,
+            causal,
+            scale
+        );
+    }
+    CUDA_KERNEL_CHECK();
+}
+
 torch::Tensor flash_attn_forward_varlen_prefill_fp16(
     torch::Tensor q,
     torch::Tensor k,
@@ -3168,7 +3372,7 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16(
     auto D = q.size(2);
     auto batch_size = cu_seqlens.size(0) - 1;
 
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
     TORCH_CHECK(k.size(0) == total_q, "k and q must have same total length");
     TORCH_CHECK(v.size(0) == total_q, "v and q must have same total length");
     TORCH_CHECK(max_seqlen > 0, "max_seqlen must be positive");
@@ -3177,26 +3381,7 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16(
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
-    int num_q_tiles = (max_seqlen + TILE_Q - 1) / TILE_Q;
-
-    dim3 grid(num_q_tiles, H, batch_size);
-    dim3 block(TILE_Q);
-
-    float scale = 1.0f / std::sqrt((float)D);
-
-    flash_attn_kernel_varlen_prefill_fp16<<<grid, block>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        cu_seqlens.data_ptr<int>(),
-        H,
-        total_q,
-        D,
-        causal,
-        scale
-    );
-    CUDA_KERNEL_CHECK();
+    launch_varlen_prefill_fp16_on_stream(q, k, v, cu_seqlens, max_seqlen, out, causal);
 
     return out;
 }
@@ -3364,7 +3549,7 @@ torch::Tensor flash_attn_forward_paged_decode_gqa_fp16(
 
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
     TORCH_CHECK(k_cache.size(2) == PAGE_BLOCK_SIZE, "k_cache block size mismatch");
     TORCH_CHECK(v_cache.size(2) == PAGE_BLOCK_SIZE, "v_cache block size mismatch");
     TORCH_CHECK(block_table.size(0) == B, "block_table batch size must match q");
@@ -3418,32 +3603,35 @@ torch::Tensor flash_attn_forward_prefill_gqa_fp16_warp(
 
     TORCH_CHECK(H_Q >= H_KV, "H_Q must be >= H_KV");
     TORCH_CHECK(H_Q % H_KV == 0, "H_Q must be divisible by H_KV");
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
     TORCH_CHECK(k.size(2) == N, "k sequence length must match q");
     TORCH_CHECK(v.size(2) == N, "v sequence length must match q");
 
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros({B, H_Q, N, D}, q.options());
 
-    dim3 grid((N + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK, B * H_Q);
-    dim3 block(WARP_BLOCK_SIZE);
+    if (D > MAX_D) {
+        launch_prefill_gqa_fp16(q, k, v, out, causal);
+    } else {
+        dim3 grid((N + QUERIES_PER_BLOCK - 1) / QUERIES_PER_BLOCK, B * H_Q);
+        dim3 block(WARP_BLOCK_SIZE);
+        float scale = 1.0f / std::sqrt((float)D);
 
-    float scale = 1.0f / std::sqrt((float)D);
-
-    flash_attn_kernel_prefill_gqa_fp16_warp<<<grid, block>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        B,
-        H_Q,
-        H_KV,
-        N,
-        D,
-        causal,
-        scale
-    );
-    CUDA_KERNEL_CHECK();
+        flash_attn_kernel_prefill_gqa_fp16_warp<<<grid, block>>>(
+            reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            B,
+            H_Q,
+            H_KV,
+            N,
+            D,
+            causal,
+            scale
+        );
+        CUDA_KERNEL_CHECK();
+    }
 
     return out;
 }
@@ -3508,7 +3696,7 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16_stream(
     auto D = q.size(2);
     auto batch_size = cu_seqlens.size(0) - 1;
 
-    TORCH_CHECK(D <= MAX_D, "D must be <= MAX_D(128)");
+    TORCH_CHECK(D <= MAX_D_LARGE, "D must be <= MAX_D_LARGE(256)");
     TORCH_CHECK(k.size(0) == total_q, "k and q must have same total length");
     TORCH_CHECK(v.size(0) == total_q, "v and q must have same total length");
     TORCH_CHECK(max_seqlen > 0, "max_seqlen must be positive");
@@ -3517,28 +3705,8 @@ torch::Tensor flash_attn_forward_varlen_prefill_fp16_stream(
     c10::cuda::CUDAGuard device_guard(q.device());
     auto out = torch::zeros_like(q);
 
-    int num_q_tiles = (max_seqlen + TILE_Q - 1) / TILE_Q;
-
-    dim3 grid(num_q_tiles, H, batch_size);
-    dim3 block(TILE_Q);
-
-    float scale = 1.0f / std::sqrt((float)D);
-
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_int);
-
-    flash_attn_kernel_varlen_prefill_fp16<<<grid, block, 0, stream>>>(
-        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        cu_seqlens.data_ptr<int>(),
-        H,
-        total_q,
-        D,
-        causal,
-        scale
-    );
-    CUDA_KERNEL_CHECK();
+    launch_varlen_prefill_fp16_on_stream(q, k, v, cu_seqlens, max_seqlen, out, causal, stream);
 
     return out;
 }
