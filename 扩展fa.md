@@ -269,6 +269,8 @@ KV cache correctness
 
 
 ### TODO
-要正确支持 D=256 需要对 kernel 进行更深入的重构（如分块计算、动态共享内存等），这是一个较大的工程。
+现在服务会一直重复后面的内容，需要修复
 
+
+### 重启nvidia_uvm模块（重置显卡缓存）
 sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm
