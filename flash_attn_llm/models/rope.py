@@ -159,6 +159,8 @@ class RotaryEmbedding(nn.Module):
         theta: Base frequency for RoPE.
         rope_scaling: Optional dict with scaling configuration.
             Supported types: "linear", "dynamic", "yarn".
+        partial_rotary_factor: Fraction of head_dim to apply RoPE to.
+            E.g. 0.25 means only the first 1/4 of dimensions get RoPE.
     """
 
     def __init__(
@@ -167,23 +169,27 @@ class RotaryEmbedding(nn.Module):
         max_position_embeddings: int = 4096,
         theta: float = 10000.0,
         rope_scaling: Optional[dict] = None,
+        partial_rotary_factor: float = 1.0,
     ):
         super().__init__()
         self.head_dim = head_dim
         self.max_position_embeddings = max_position_embeddings
         self.theta = theta
         self.rope_scaling = rope_scaling
+        self.partial_rotary_factor = partial_rotary_factor
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
 
-        # Compute and register cos/sin buffers
-        cos, sin = self._compute_rope_parameters()
-        self.register_buffer("cos_cached", cos, persistent=False)
-        self.register_buffer("sin_cached", sin, persistent=False)
+        # Precompute inverse frequencies only (much smaller than full cos/sin tables)
+        # For large max_position_embeddings, full cos/sin tables would be too large
+        # (e.g. 262144 * 256 * 4 bytes * 2 = 537 MB per layer)
+        inv_freq = 1.0 / (theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _compute_rope_parameters(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute RoPE parameters based on the scaling strategy."""
         if self.rope_scaling is None:
             return _compute_default_rope_parameters(
-                self.head_dim, self.max_position_embeddings, self.theta
+                self.rotary_dim, self.max_position_embeddings, self.theta
             )
 
         scaling_type = self.rope_scaling.get("type", "default")
@@ -191,11 +197,11 @@ class RotaryEmbedding(nn.Module):
 
         if scaling_type == "linear":
             return _compute_linear_scaling_rope_parameters(
-                self.head_dim, self.max_position_embeddings, self.theta, scaling_factor
+                self.rotary_dim, self.max_position_embeddings, self.theta, scaling_factor
             )
         elif scaling_type == "dynamic":
             return _compute_dynamic_scaling_rope_parameters(
-                self.head_dim, self.max_position_embeddings, self.theta, scaling_factor
+                self.rotary_dim, self.max_position_embeddings, self.theta, scaling_factor
             )
         elif scaling_type == "yarn":
             original_max_pos = self.rope_scaling.get(
@@ -205,7 +211,7 @@ class RotaryEmbedding(nn.Module):
             beta_slow = self.rope_scaling.get("beta_slow", 1.0)
             mscale = self.rope_scaling.get("mscale", 1.0)
             return _compute_yarn_rope_parameters(
-                self.head_dim,
+                self.rotary_dim,
                 self.max_position_embeddings,
                 self.theta,
                 scaling_factor,
@@ -216,13 +222,17 @@ class RotaryEmbedding(nn.Module):
             )
         else:
             return _compute_default_rope_parameters(
-                self.head_dim, self.max_position_embeddings, self.theta
+                self.rotary_dim, self.max_position_embeddings, self.theta
             )
 
     def forward(
         self, seq_len: int, position_ids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get cos and sin values for the given positions.
+
+        Dynamically computes cos/sin from inv_freq to avoid storing huge
+        precomputed tables (which would be ~537 MB per layer for large
+        max_position_embeddings).
 
         Args:
             seq_len: Length of the sequence.
@@ -231,17 +241,29 @@ class RotaryEmbedding(nn.Module):
 
         Returns:
             Tuple of (cos, sin) tensors. If position_ids is None, shapes are
-            [1, 1, seq_len, head_dim]. Otherwise [B, 1, seq_len, head_dim].
+            [1, 1, seq_len, rotary_dim]. Otherwise [B, 1, seq_len, rotary_dim].
         """
         if position_ids is not None:
             # position_ids: [B, seq_len]
-            cos = self.cos_cached[position_ids]  # [B, seq_len, head_dim]
-            sin = self.sin_cached[position_ids]
-            return cos.unsqueeze(1), sin.unsqueeze(1)  # [B, 1, seq_len, head_dim]
+            positions = position_ids.float()  # [B, seq_len]
         else:
-            cos = self.cos_cached[:seq_len]  # [seq_len, head_dim]
-            sin = self.sin_cached[:seq_len]
-            return cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim]
+            positions = torch.arange(seq_len, dtype=torch.float32, device=self.inv_freq.device)  # [seq_len]
+
+        # Compute freqs: positions x inv_freq -> [B, seq_len, rotary_dim//2] or [seq_len, rotary_dim//2]
+        freqs = torch.outer(positions.flatten(), self.inv_freq) if position_ids is None else torch.einsum("bs,d->bsd", positions, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)  # [..., rotary_dim]
+        cos = emb.cos()
+        sin = emb.sin()
+
+        if position_ids is not None:
+            B = position_ids.shape[0]
+            cos = cos.view(B, position_ids.shape[1], self.rotary_dim)
+            sin = sin.view(B, position_ids.shape[1], self.rotary_dim)
+            return cos.unsqueeze(1), sin.unsqueeze(1)  # [B, 1, seq_len, rotary_dim]
+        else:
+            cos = cos.view(seq_len, self.rotary_dim)
+            sin = sin.view(seq_len, self.rotary_dim)
+            return cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, rotary_dim]
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -286,19 +308,41 @@ def apply_rotary_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding to query and key tensors.
 
+    Supports partial rotary embeddings where only a fraction of the head_dim
+    dimensions receive RoPE (the rest pass through unchanged).
+
     Args:
         q: Query tensor of shape [B, H_Q, seq_len, D].
         k: Key tensor of shape [B, H_KV, seq_len, D].
-        cos: Cosine values of shape [B_or_1, 1, seq_len, D].
-        sin: Sine values of shape [B_or_1, 1, seq_len, D].
+        cos: Cosine values of shape [B_or_1, 1, seq_len, rotary_dim].
+        sin: Sine values of shape [B_or_1, 1, seq_len, rotary_dim].
         interleaved: If True, use interleaved rotary layout (GPT-NeoX style).
             If False, use half-rotation layout (LLaMA style).
 
     Returns:
         Tuple of (q_rotated, k_rotated) with the same shapes as inputs.
     """
-    rotate_fn = _rotate_half_interleaved if interleaved else _rotate_half
+    rotary_dim = cos.shape[-1]
 
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    # Cast cos/sin to match q's dtype to avoid type promotion
+    cos = cos.to(q.dtype)
+    sin = sin.to(q.dtype)
+
+    # Full rotary: apply to all dimensions
+    if rotary_dim == q.shape[-1]:
+        q_embed = (q * cos) + (_rotate_half(q) * sin)
+        k_embed = (k * cos) + (_rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    # Partial rotary: split into rotary and non-rotary parts
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+
+    q_rot_embed = (q_rot * cos) + (_rotate_half(q_rot) * sin)
+    k_rot_embed = (k_rot * cos) + (_rotate_half(k_rot) * sin)
+
+    q_embed = torch.cat([q_rot_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_rot_embed, k_pass], dim=-1)
     return q_embed, k_embed

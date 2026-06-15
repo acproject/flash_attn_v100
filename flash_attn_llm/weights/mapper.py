@@ -289,89 +289,103 @@ def _build_yi_mapper() -> WeightMapper:
     return mapper
 
 
-def _build_gemma_mapper() -> WeightMapper:
-    """Build the WeightMapper for Gemma models.
+def _build_gemma4_mapper() -> WeightMapper:
+    """Build the WeightMapper for Gemma4 models.
 
-    Gemma has different norm naming:
-    - post_feedforward_layernorm -> post_attention_layernorm
-    - pre_feedforward_layernorm -> input_layernorm (pre-norm before MLP)
+    Gemma4 weights are prefixed with 'model.language_model.' instead of 'model.'.
+    Has QK normalization (q_norm, k_norm), pre/post feedforward layernorms,
+    and per-layer scalar (layer_scalar).
     """
     rules: List[MappingRule] = [
         # Embedding
         MappingRule(
-            pattern=re.compile(r'model\.embed_tokens\.weight'),
+            pattern=re.compile(r'model\.language_model\.embed_tokens\.weight'),
             replacement='embed_tokens.weight',
             shard_spec=ShardSpec(shard_dim=1, is_column=False),
         ),
         # Attention projections
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.self_attn\.q_proj\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.weight'),
             replacement='layers.{}.self_attn.q_proj.weight',
             shard_spec=ShardSpec(shard_dim=0, is_column=True),
         ),
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.self_attn\.k_proj\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.self_attn\.k_proj\.weight'),
             replacement='layers.{}.self_attn.k_proj.weight',
             shard_spec=ShardSpec(shard_dim=0, is_column=True),
         ),
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.self_attn\.v_proj\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.self_attn\.v_proj\.weight'),
             replacement='layers.{}.self_attn.v_proj.weight',
             shard_spec=ShardSpec(shard_dim=0, is_column=True),
         ),
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.self_attn\.o_proj\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.weight'),
             replacement='layers.{}.self_attn.o_proj.weight',
             shard_spec=ShardSpec(shard_dim=1, is_column=False),
         ),
+        # QK normalization
+        MappingRule(
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.self_attn\.q_norm\.weight'),
+            replacement='layers.{}.self_attn.q_norm.weight',
+        ),
+        MappingRule(
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.self_attn\.k_norm\.weight'),
+            replacement='layers.{}.self_attn.k_norm.weight',
+        ),
         # MLP projections
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.mlp\.gate_proj\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.weight'),
             replacement='layers.{}.mlp.gate_proj.weight',
             shard_spec=ShardSpec(shard_dim=0, is_column=True),
         ),
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.mlp\.up_proj\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.mlp\.up_proj\.weight'),
             replacement='layers.{}.mlp.up_proj.weight',
             shard_spec=ShardSpec(shard_dim=0, is_column=True),
         ),
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.mlp\.down_proj\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.weight'),
             replacement='layers.{}.mlp.down_proj.weight',
             shard_spec=ShardSpec(shard_dim=1, is_column=False),
         ),
-        # Layer norms - Gemma specific naming
+        # Layer norms
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.input_layernorm\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.input_layernorm\.weight'),
             replacement='layers.{}.input_layernorm.weight',
         ),
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.post_feedforward_layernorm\.weight'),
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.post_attention_layernorm\.weight'),
             replacement='layers.{}.post_attention_layernorm.weight',
         ),
         MappingRule(
-            pattern=re.compile(r'model\.layers\.(\d+)\.pre_feedforward_layernorm\.weight'),
-            replacement='layers.{}.input_layernorm.weight',
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.pre_feedforward_layernorm\.weight'),
+            replacement='layers.{}.pre_feedforward_layernorm.weight',
+        ),
+        MappingRule(
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.post_feedforward_layernorm\.weight'),
+            replacement='layers.{}.post_feedforward_layernorm.weight',
+        ),
+        # Per-layer scalar
+        MappingRule(
+            pattern=re.compile(r'model\.language_model\.layers\.(\d+)\.layer_scalar'),
+            replacement='layers.{}.layer_scalar',
         ),
         # Final norm
         MappingRule(
-            pattern=re.compile(r'model\.norm\.weight'),
+            pattern=re.compile(r'model\.language_model\.norm\.weight'),
             replacement='norm.weight',
-        ),
-        # LM head
-        MappingRule(
-            pattern=re.compile(r'lm_head\.weight'),
-            replacement='lm_head.weight',
-            shard_spec=ShardSpec(shard_dim=0, is_column=True),
         ),
     ]
 
+    # Tied embeddings: lm_head shares weights with embed_tokens
+    # (no lm_head.weight in Gemma4 safetensors since tie_word_embeddings=true)
     tied_weights: Dict[str, str] = {
         'lm_head.weight': 'embed_tokens.weight',
     }
 
     return WeightMapper(
-        model_type='gemma',
+        model_type='gemma4',
         rules=rules,
         tied_weights=tied_weights,
     )
@@ -388,7 +402,9 @@ _MAPPER_BUILDERS: Dict[str, object] = {
     'qwen3': _build_qwen3_mapper,
     'mistral': _build_mistral_mapper,
     'yi': _build_yi_mapper,
-    'gemma': _build_gemma_mapper,
+    'gemma': _build_gemma4_mapper,
+    'gemma4': _build_gemma4_mapper,
+    'gemma4_text': _build_gemma4_mapper,
 }
 
 # Common aliases for model architectures
@@ -400,8 +416,10 @@ _MODEL_TYPE_ALIASES: Dict[str, str] = {
     'mistral': 'mistral',
     'mixtral': 'mistral',
     'yi': 'yi',
-    'gemma': 'gemma',
-    'gemma2': 'gemma',
+    'gemma': 'gemma4',
+    'gemma2': 'gemma4',
+    'gemma4': 'gemma4',
+    'gemma4_text': 'gemma4',
 }
 
 

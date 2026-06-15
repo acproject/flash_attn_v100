@@ -15,6 +15,19 @@ from .decoder_layer import TransformerDecoderLayer
 from .norm import RMSNorm
 
 
+def _safe_cross_device(tensor: torch.Tensor, target_device: torch.device) -> torch.Tensor:
+    """Move tensor to target device, using CPU as intermediate for cross-GPU transfers.
+
+    Direct .to() cross-GPU is broken in PyTorch 2.8+V100 (data gets corrupted).
+    Transferring via CPU is reliable.
+    """
+    if tensor.device == target_device:
+        return tensor
+    if tensor.device.type == "cuda" and target_device.type == "cuda" and tensor.device.index != target_device.index:
+        return tensor.cpu().to(target_device)
+    return tensor.to(target_device)
+
+
 class KVCacheManager:
     """Manages KV caches for all layers during autoregressive generation.
 
@@ -133,15 +146,37 @@ class CausalLM(nn.Module):
         self.config = config
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_scale = config.hidden_size ** 0.5  # Gemma-style embedding scaling
         self.layers = nn.ModuleList(
-            [TransformerDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [TransformerDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Tie embeddings if configured
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.embed_tokens.weight
+        # Note: For multi-GPU pipeline parallelism, we do NOT tie weights here
+        # even if tie_word_embeddings=True, because shared parameters cannot
+        # reside on different devices. The weight loader handles copying
+        # embed_tokens weights to lm_head when tie_word_embeddings=True.
+        self.tie_word_embeddings = getattr(config, 'tie_word_embeddings', False)
+
+        # Gemma4-style: final logit softcapping
+        self.final_logit_softcapping = getattr(config, 'final_logit_softcapping', None)
+
+    def _apply_logit_softcapping(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply logit softcapping if configured.
+
+        Computes: cap * tanh(logits / cap)
+
+        Args:
+            logits: Raw logits tensor.
+
+        Returns:
+            Softcapped logits if final_logit_softcapping is set, else unchanged.
+        """
+        if self.final_logit_softcapping is not None:
+            cap = self.final_logit_softcapping
+            logits = cap * torch.tanh(logits / cap)
+        return logits
 
     def forward_prefill(
         self,
@@ -150,6 +185,9 @@ class CausalLM(nn.Module):
         return_kv_cache: bool = False,
     ) -> torch.Tensor:
         """Prefill forward pass for processing a full prompt.
+
+        Supports multi-GPU pipeline: hidden_states are moved to each layer's
+        device automatically when layers are on different GPUs.
 
         Args:
             input_ids: Token IDs [B, seq_len].
@@ -163,16 +201,38 @@ class CausalLM(nn.Module):
                 Tuple of (logits, kv_caches) where kv_caches is a list of
                 (k_cache, v_cache) tuples, one per layer.
         """
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(_safe_cross_device(input_ids, self.embed_tokens.weight.device)) * self.embed_scale
 
         kv_caches = [] if return_kv_cache else None
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            # Move hidden_states to layer's device (handles multi-GPU)
+            layer_device = layer.self_attn.q_proj.weight.device
+            if hidden_states.device != layer_device:
+                hidden_states = _safe_cross_device(hidden_states, layer_device)
+                if position_ids is not None and position_ids.device != layer_device:
+                    position_ids = _safe_cross_device(position_ids, layer_device)
+            # Debug: check hidden_states before layer
+            if hidden_states.isnan().any().item():
+                print(f"  NaN in hidden_states BEFORE layer {i}! device={hidden_states.device}")
+                break
             hidden_states, kv = layer.forward_prefill(hidden_states, position_ids)
             if return_kv_cache:
                 kv_caches.append(kv)
+            # Debug: check for NaN after each layer (only print for first few or NaN)
+            if hidden_states.isnan().any().item():
+                print(f"  NaN detected after layer {i} (type={getattr(self.config, 'layer_types', ['?'])[i] if hasattr(self.config, 'layer_types') and self.config.layer_types else '?'}), head_dim={layer.self_attn.head_dim}, k_eq_v={layer.self_attn.k_eq_v}")
+                break
+            elif i < 6:
+                print(f"  Layer {i} OK: sum={hidden_states.sum().item():.4f}, device={hidden_states.device}")
+
+        # Move to norm/lm_head device
+        norm_device = self.norm.weight.device
+        if hidden_states.device != norm_device:
+            hidden_states = _safe_cross_device(hidden_states, norm_device)
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
+        logits = self._apply_logit_softcapping(logits)
 
         if return_kv_cache:
             return logits, kv_caches
@@ -187,6 +247,9 @@ class CausalLM(nn.Module):
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Decode forward pass for single-token generation.
 
+        Supports multi-GPU pipeline: hidden_states are moved to each layer's
+        device automatically when layers are on different GPUs.
+
         Args:
             input_ids: Token IDs [B, 1].
             kv_caches: List of (k_cache, v_cache) tuples, one per layer.
@@ -198,17 +261,29 @@ class CausalLM(nn.Module):
                 - Logits tensor [B, 1, vocab_size]
                 - Updated KV caches list
         """
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(_safe_cross_device(input_ids, self.embed_tokens.weight.device)) * self.embed_scale
 
         updated_kv_caches = []
         for i, layer in enumerate(self.layers):
+            # Move hidden_states to layer's device (handles multi-GPU)
+            layer_device = layer.self_attn.q_proj.weight.device
+            if hidden_states.device != layer_device:
+                hidden_states = _safe_cross_device(hidden_states, layer_device)
+                if position_ids is not None and position_ids.device != layer_device:
+                    position_ids = _safe_cross_device(position_ids, layer_device)
             hidden_states, updated_kv = layer.forward_decode(
                 hidden_states, kv_caches[i], cache_len, position_ids
             )
             updated_kv_caches.append(updated_kv)
 
+        # Move to norm/lm_head device
+        norm_device = self.norm.weight.device
+        if hidden_states.device != norm_device:
+            hidden_states = _safe_cross_device(hidden_states, norm_device)
+
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
+        logits = self._apply_logit_softcapping(logits)
         return logits, updated_kv_caches
 
     def forward(

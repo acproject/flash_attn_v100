@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
+import torch.nn as nn
 
 from .mapper import WeightMapper, get_mapper
 
@@ -69,7 +70,7 @@ def _resolve_dtype(dtype: Any) -> torch.dtype:
 
 def load_safetensors(
     path: str,
-    device: str = "cpu",
+    device: str = "cuda",
     dtype: torch.dtype = torch.float16,
 ) -> Dict[str, torch.Tensor]:
     """Load weights from a single safetensors file.
@@ -110,7 +111,7 @@ def load_safetensors(
 
 def load_pytorch_bin(
     path: str,
-    device: str = "cpu",
+    device: str = "cuda",
     dtype: torch.dtype = torch.float16,
 ) -> Dict[str, torch.Tensor]:
     """Load weights from a single PyTorch .bin file.
@@ -219,7 +220,7 @@ def _find_files(
 
 def load_all_weights(
     model_path: str,
-    device: str = "cpu",
+    device: str = "粗大",
     dtype: torch.dtype = torch.float16,
 ) -> Dict[str, torch.Tensor]:
     """Load all weights from a model directory.
@@ -427,7 +428,7 @@ class WeightLoader:
         Args:
             model: The target model (nn.Module) to load weights into.
             model_path: Path to the HuggingFace model directory.
-            device: Target device ('cpu', 'cuda', etc.).
+            device: Target device ('cuda', 'cuda', etc.).
             dtype: Target dtype. Can be torch.dtype or string ('fp16', 'bf16', etc.).
             layers: Optional list of layer indices to load. None loads all layers.
 
@@ -448,87 +449,204 @@ class WeightLoader:
         self._mapper = get_mapper(effective_model_type)
         logger.info("Using mapper for model_type='%s'", effective_model_type)
 
-        # 2. Load all weights from disk
-        raw_weights = load_all_weights(model_path, device="cpu", dtype=resolved_dtype)
+        # 2. Discover weight files
+        weight_files = get_weight_files(model_path)
+        logger.info("Found %d weight file(s) in %s", len(weight_files), model_path)
 
-        # 3. Map HF names to internal names
-        hf_names = list(raw_weights.keys())
-        name_mapping = self._mapper.map_all(hf_names)
-
-        mapped_weights: Dict[str, torch.Tensor] = {}
-        num_skipped = 0
-        for hf_name, tensor in raw_weights.items():
-            if hf_name in name_mapping:
-                mapped_weights[name_mapping[hf_name]] = tensor
-            else:
-                num_skipped += 1
-                logger.debug("Skipped unmapped weight: %s", hf_name)
-
-        # 4. Filter to specific layers if requested
-        mapped_weights = _filter_weights(mapped_weights, layers)
-
-        # 5. Resolve tied weights
-        tied_weights: Dict[str, torch.Tensor] = {}
-        for internal_name, tensor in mapped_weights.items():
-            resolved_name = self._mapper.resolve_tied(internal_name)
-            if resolved_name != internal_name:
-                # This weight is tied; we store it under the source name
-                if resolved_name not in mapped_weights:
-                    tied_weights[resolved_name] = tensor
-                # The tied target is not loaded separately
-            else:
-                tied_weights[internal_name] = tensor
-
-        # 6. Shard for tensor parallelism
-        num_sharded = 0
-        if self.tp_size > 1:
-            sharded: Dict[str, torch.Tensor] = {}
-            for name, tensor in tied_weights.items():
-                spec = self._mapper.get_shard_spec(name)
-                if spec is not None:
-                    sharded[name] = shard_weight(
-                        tensor, self.tp_rank, self.tp_size, spec.shard_dim
-                    )
-                    num_sharded += 1
-                else:
-                    sharded[name] = tensor
-            tied_weights = sharded
-
-        # 7. Load into model
+        # 3. Get model state dict once (references to parameters on their devices)
         model_state = model.state_dict()
         num_loaded = 0
+        num_skipped = 0
+        num_sharded = 0
+        num_total = 0
+        num_skipped_no_mapping = 0
+        num_skipped_not_in_model = 0
         loaded_keys: Set[str] = set()
 
-        for param_name, tensor in tied_weights.items():
-            if param_name in model_state:
-                # Move to target device
-                tensor = tensor.to(device=device)
-                # Handle size mismatch (e.g. due to TP sharding)
-                if tensor.shape == model_state[param_name].shape:
-                    model_state[param_name].copy_(tensor)
-                    loaded_keys.add(param_name)
-                    num_loaded += 1
-                else:
-                    logger.warning(
-                        "Shape mismatch for '%s': weight=%s, model=%s. Skipping.",
-                        param_name,
-                        tuple(tensor.shape),
-                        tuple(model_state[param_name].shape),
-                    )
-            else:
-                logger.debug("Weight '%s' not found in model parameters", param_name)
+        # 4. Load shard by shard, copy to GPU immediately, free cuda memory
+        for filepath in weight_files:
+            if filepath.endswith(".safetensors"):
+                # Load each tensor directly to its target GPU device
+                # First pass: determine all target devices for this shard
+                from safetensors import safe_open
+                
+                with safe_open(filepath, framework="pt", device="cuda") as f:
+                    shard_keys = list(f.keys())
+                    num_total += len(shard_keys)
 
-        # Also handle tied params: if lm_head.weight is tied to embed_tokens.weight,
-        # make sure both are set
+                    hf_names = shard_keys
+                    name_mapping = self._mapper.map_all(hf_names)
+
+                    # Group tensors by target device
+                    tensors_by_device = {}
+                    for hf_name in shard_keys:
+                        if hf_name not in name_mapping:
+                            num_skipped += 1
+                            continue
+
+                        internal_name = name_mapping[hf_name]
+
+                        # Filter by layer index if requested
+                        if layers is not None:
+                            idx = _parse_layer_index(internal_name)
+                            if idx is not None and idx not in set(layers):
+                                num_skipped += 1
+                                continue
+
+                        # Resolve tied weights
+                        resolved_name = self._mapper.resolve_tied(internal_name)
+                        if resolved_name != internal_name:
+                            if resolved_name in model_state:
+                                internal_name = resolved_name
+                            else:
+                                num_skipped += 1
+                                continue
+
+                        # Determine target device from model parameter
+                        if internal_name not in model_state:
+                            logger.debug("Weight '%s' not found in model parameters", internal_name)
+                            num_skipped += 1
+                            num_skipped_not_in_model += 1
+                            continue
+
+                        target_device = model_state[internal_name].device
+                        
+                        if target_device not in tensors_by_device:
+                            tensors_by_device[target_device] = []
+                        tensors_by_device[target_device].append((hf_name, internal_name))
+
+                # Second pass: load tensors by device to avoid cuda memory
+                for target_device, tensor_pairs in tensors_by_device.items():
+                    # Open file with target device
+                    with safe_open(filepath, framework="pt", device=str(target_device)) as f:
+                        for hf_name, internal_name in tensor_pairs:
+                            # Load tensor directly to target device
+                            tensor = f.get_tensor(hf_name)
+                            tensor = tensor.to(dtype=model_state[internal_name].dtype)
+
+                            # Shard for tensor parallelism
+                            if self.tp_size > 1:
+                                spec = self._mapper.get_shard_spec(internal_name)
+                                if spec is not None:
+                                    tensor = shard_weight(
+                                        tensor, self.tp_rank, self.tp_size, spec.shard_dim
+                                    )
+                                    num_sharded += 1
+
+                            if tensor.shape == model_state[internal_name].shape:
+                                model_state[internal_name].data.copy_(tensor)
+                                loaded_keys.add(internal_name)
+                                num_loaded += 1
+                            else:
+                                logger.warning(
+                                    "Shape mismatch for '%s': weight=%s, model=%s. Skipping.",
+                                    internal_name,
+                                    tuple(tensor.shape),
+                                    tuple(model_state[internal_name].shape),
+                                )
+            elif filepath.endswith(".bin"):
+                shard = load_pytorch_bin(filepath, device="cuda", dtype=resolved_dtype)
+                num_total += len(shard)
+
+                hf_names = list(shard.keys())
+                name_mapping = self._mapper.map_all(hf_names)
+
+                for hf_name, tensor in shard.items():
+                    if hf_name not in name_mapping:
+                        num_skipped += 1
+                        num_skipped_no_mapping += 1
+                        continue
+
+                    internal_name = name_mapping[hf_name]
+
+                    if layers is not None:
+                        idx = _parse_layer_index(internal_name)
+                        if idx is not None and idx not in set(layers):
+                            num_skipped += 1
+                            continue
+
+                    resolved_name = self._mapper.resolve_tied(internal_name)
+                    if resolved_name != internal_name:
+                        if resolved_name in model_state:
+                            internal_name = resolved_name
+                        else:
+                            num_skipped += 1
+                            continue
+
+                    if internal_name not in model_state:
+                        num_skipped += 1
+                        continue
+
+                    target_device = model_state[internal_name].device
+                    tensor = tensor.to(device=target_device, dtype=model_state[internal_name].dtype)
+
+                    if self.tp_size > 1:
+                        spec = self._mapper.get_shard_spec(internal_name)
+                        if spec is not None:
+                            tensor = shard_weight(
+                                tensor, self.tp_rank, self.tp_size, spec.shard_dim
+                            )
+                            num_sharded += 1
+
+                    if tensor.shape == model_state[internal_name].shape:
+                        model_state[internal_name].data.copy_(tensor)
+                        loaded_keys.add(internal_name)
+                        num_loaded += 1
+                    else:
+                        logger.warning(
+                            "Shape mismatch for '%s': weight=%s, model=%s. Skipping.",
+                            internal_name,
+                            tuple(tensor.shape),
+                            tuple(model_state[internal_name].shape),
+                        )
+
+                del shard
+                del name_mapping
+            else:
+                logger.warning("Skipping unknown file format: %s", filepath)
+                continue
+
+        # 5. Handle tied params: copy source -> target on the same device
         for target_name, source_name in self._mapper.tied_weights.items():
+            print(
+                f"Tied weight check: target={target_name} (in model={target_name in model_state}, "
+                f"loaded={target_name in loaded_keys}), source={source_name} (loaded={source_name in loaded_keys})"
+            )
             if source_name in loaded_keys and target_name in model_state:
                 if target_name not in loaded_keys:
-                    model_state[target_name].copy_(model_state[source_name])
+                    src = model_state[source_name]
+                    tgt = model_state[target_name]
+                    print(
+                        f"Tied weight: copying {source_name} ({src.device}, shape={tuple(src.shape)}) "
+                        f"-> {target_name} ({tgt.device}, shape={tuple(tgt.shape)})"
+                    )
+                    # to_empty() tensors don't support copy_() reliably.
+                    # Also, direct .to() cross-device is broken in PyTorch 2.8+V100
+                    # for large tensors. Must transfer via CPU.
+                    src_param = dict(model.named_parameters())[source_name]
+                    print(f"  src from model.named_parameters(): sum={src_param.sum().item():.4f}, device={src_param.device}")
+                    src_on_tgt_device = src_param.data.cpu().to(tgt.device)
+                    print(f"  src_on_tgt_device sum: {src_on_tgt_device.sum().item():.4f}, device: {src_on_tgt_device.device}")
+                    # Find the module that owns this parameter and replace it
+                    parts = target_name.rsplit(".", 1)
+                    if len(parts) == 2:
+                        parent_name, attr_name = parts
+                        parent_module = model.get_submodule(parent_name)
+                        setattr(parent_module, attr_name, nn.Parameter(src_on_tgt_device))
+                    else:
+                        # Top-level parameter
+                        setattr(model, target_name, nn.Parameter(src_on_tgt_device))
+                    # Verify
+                    new_param = model.get_submodule(target_name.rsplit(".", 1)[0]) if "." in target_name else getattr(model, target_name)
+                    if "." in target_name:
+                        new_param = getattr(new_param, target_name.rsplit(".", 1)[1])
+                    print(f"  After setattr, {target_name} sum: {new_param.sum().item():.4f}, device: {new_param.device}")
+                    loaded_keys.add(target_name)
                     num_loaded += 1
 
         load_time = time.time() - start_time
         stats = {
-            "num_total": len(raw_weights),
+            "num_total": num_total,
             "num_loaded": num_loaded,
             "num_skipped": num_skipped,
             "num_sharded": num_sharded,
@@ -537,11 +655,14 @@ class WeightLoader:
         }
 
         logger.info(
-            "Weight loading complete: %d/%d loaded, %d skipped, "
+            "Weight loading complete: %d/%d loaded, %d skipped "
+            "(no_mapping=%d, not_in_model=%d), "
             "%d sharded, %.2fs",
             num_loaded,
-            len(raw_weights),
+            num_total,
             num_skipped,
+            num_skipped_no_mapping,
+            num_skipped_not_in_model,
             num_sharded,
             load_time,
         )

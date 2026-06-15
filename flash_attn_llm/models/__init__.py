@@ -9,6 +9,7 @@ from .config import (
     Qwen2Config,
     Qwen3Config,
     MistralConfig,
+    Gemma4Config,
     MODEL_CONFIG_REGISTRY,
     get_config_from_hf_json,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "Qwen2Config",
     "Qwen3Config",
     "MistralConfig",
+    "Gemma4Config",
     "MODEL_CONFIG_REGISTRY",
     "get_config_from_hf_json",
     # Norm

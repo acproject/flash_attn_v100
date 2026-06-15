@@ -270,3 +270,5 @@ KV cache correctness
 
 ### TODO
 要正确支持 D=256 需要对 kernel 进行更深入的重构（如分块计算、动态共享内存等），这是一个较大的工程。
+
+sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm

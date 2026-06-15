@@ -19,16 +19,20 @@ from .norm import RMSNorm
 class TransformerDecoderLayer(nn.Module):
     """Single transformer decoder layer with pre-norm residual connections.
 
-    Contains self-attention, MLP, and two RMSNorm layers (input and post-attention).
-    Supports both prefill and decode forward passes.
+    Contains self-attention, MLP, and normalization layers.
+    Supports both the standard 2-norm (Llama-style) and 3-norm (Gemma4-style)
+    architectures, as well as per-layer learnable scalar (layer_scalar).
+
+    Standard (2-norm): input_layernorm + post_attention_layernorm
+    Gemma4 (3-norm): input_layernorm + post_attention_layernorm + pre_feedforward_layernorm
 
     Args:
         config: ModelConfig instance with layer hyperparameters.
     """
 
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, layer_idx: int = 0):
         super().__init__()
-        self.self_attn = LlamaAttention(config)
+        self.self_attn = LlamaAttention(config, layer_idx=layer_idx)
         self.mlp = build_mlp(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -36,6 +40,15 @@ class TransformerDecoderLayer(nn.Module):
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Gemma4-style: pre/post feedforward layernorms (4-norm architecture)
+        self.has_pre_feedforward_norm = hasattr(config, 'layer_types') and config.layer_types is not None
+        if self.has_pre_feedforward_norm:
+            self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Gemma4-style: per-layer learnable scalar (buffer, not parameter)
+        self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward_prefill(
         self,
@@ -57,13 +70,19 @@ class TransformerDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, kv_cache = self.self_attn.forward_prefill(hidden_states, position_ids)
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        # MLP with residual
+        # Feedforward with residual
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.pre_feedforward_layernorm(hidden_states) if self.has_pre_feedforward_norm else self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.has_pre_feedforward_norm:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
+
+        # Gemma4-style: per-layer scalar
+        hidden_states = hidden_states * self.layer_scalar
 
         return hidden_states, kv_cache
 
@@ -93,13 +112,19 @@ class TransformerDecoderLayer(nn.Module):
         hidden_states, updated_kv_cache = self.self_attn.forward_decode(
             hidden_states, kv_cache, cache_len, position_ids
         )
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        # MLP with residual
+        # Feedforward with residual
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.pre_feedforward_layernorm(hidden_states) if self.has_pre_feedforward_norm else self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.has_pre_feedforward_norm:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
+
+        # Gemma4-style: per-layer scalar
+        hidden_states = hidden_states * self.layer_scalar
 
         return hidden_states, updated_kv_cache
 
